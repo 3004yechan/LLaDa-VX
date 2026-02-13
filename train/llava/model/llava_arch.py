@@ -82,9 +82,11 @@ class LlavaMetaModel:
                 vision_tower = self.vision_tower
             vision_tower.load_model()
 
-            # In case it is frozen by LoRA
-            for p in self.vision_resampler.parameters():
-                p.requires_grad = True
+            # In case it is frozen by LoRA; only unfreeze when requested
+            if getattr(model_args, "mm_tunable_parts", None) and "mm_vision_tower" in model_args.mm_tunable_parts:
+                for p in self.vision_resampler.parameters():
+                    if p.is_floating_point() or p.is_complex():
+                        p.requires_grad = True
 
         self.config.use_mm_proj = True
         self.config.mm_projector_type = getattr(model_args, "mm_projector_type", "linear")
@@ -110,7 +112,8 @@ class LlavaMetaModel:
         else:
             # In case it is frozen by LoRA
             for p in self.mm_projector.parameters():
-                p.requires_grad = True
+                if p.is_floating_point() or p.is_complex():
+                    p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location="cpu")

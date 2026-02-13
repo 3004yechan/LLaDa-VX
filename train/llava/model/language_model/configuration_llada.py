@@ -114,6 +114,7 @@ class LLaDAConfig(PretrainedConfig):
         pad_token_id=None,
         bos_token_id=1,
         eos_token_id=2,
+        enable_complementary_masking: bool = False,
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_theta=10000.0,
@@ -144,6 +145,8 @@ class LLaDAConfig(PretrainedConfig):
         self._rope_scaling_validation()
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        # Whether to duplicate each sequence with an inverted mask (complementary masking).
+        self.enable_complementary_masking = enable_complementary_masking
 
         super().__init__(
             pad_token_id=pad_token_id,

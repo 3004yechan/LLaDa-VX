@@ -25,15 +25,18 @@ use_fast_dllm = False  # using fast-dLLM (https://github.com/NVlabs/Fast-dLLM) t
 use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cache) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 25s to generate 128 tokens.
 
 warnings.filterwarnings("ignore")
-pretrained = "/home/20223206/model/LLaDA-V-HF"
+# pretrained = "GSAI-ML/LLaDA-V"
+pretrained = "./exp/llada_v_qlora_single"
+model_base = "/home/20223206/model/LLaDA-V-HF"
 
-model_name = "llava_llada"
+model_name = "llava_llada_lora"
 device = "cuda:0"
 device_map = "cuda:0"
-tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, attn_implementation="sdpa", device_map=device_map, load_4bit=True)  # Add any other thing you want to pass in llava_model_args
+
+tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, model_base, model_name, attn_implementation="sdpa", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 
 model.eval()
-image = Image.open("test.jpg")
+image = Image.open("tennis.jpg")
 image_tensor = process_images([image], image_processor, model.config)
 image_tensor = [_image.to(dtype=torch.float16, device=device) for _image in image_tensor]
 
@@ -69,11 +72,24 @@ input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX,
 image_sizes = [image.size]
 
 start_time = time.time()
+# Properly pass stopping criteria as token ids; using raw strings can encode to empty and stop immediately.
+stop_tokens = None
+try:
+    stop_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+    if stop_id is not None and stop_id != tokenizer.pad_token_id:
+        stop_tokens = [stop_id]
+except Exception:
+    stop_tokens = None
+
 cont = model.generate(
     input_ids,
     images=image_tensor,
     image_sizes=image_sizes,
-    steps=128, gen_length=128, block_length=128, tokenizer=tokenizer, stopping_criteria=['<|eot_id|>'], 
+    steps=128,
+    gen_length=128,
+    block_length=128,
+    tokenizer=tokenizer,
+    stopping_criteria=stop_tokens,
     prefix_refresh_interval=32,
     threshold=1,
 )

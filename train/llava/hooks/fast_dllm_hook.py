@@ -155,6 +155,7 @@ class FastDLLMGenerationHook:
         images: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         modalities: Optional[List[str]] = ["image"],
+        draft_tokens: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         modalities = kwargs.pop("modalities", None) if "modalities" in kwargs and modalities is None else modalities
@@ -167,7 +168,7 @@ class FastDLLMGenerationHook:
             (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.model.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
         else:
             inputs_embeds = self.model.get_model().embed_tokens(inputs)
-        output = self._fast_generate_with_embeds(inputs_embeds=inputs_embeds, **kwargs)
+        output = self._fast_generate_with_embeds(inputs_embeds=inputs_embeds, draft_tokens=draft_tokens, **kwargs)
         return output
     
     @torch.no_grad()
@@ -186,6 +187,7 @@ class FastDLLMGenerationHook:
         generation_suffix=None, 
         threshold=None, 
         prefix_refresh_interval=32, 
+        draft_tokens: Optional[torch.Tensor] = None,
         **kwargs
     ):
         """
@@ -216,6 +218,22 @@ class FastDLLMGenerationHook:
             x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
             if suffix_token_ids is not None:
                 x[:, -suffix_len:] = suffix_token_ids
+
+            # --- FIM draft support start ---
+            if draft_tokens is not None:
+                draft_tokens = draft_tokens.to(x.device)
+                if draft_tokens.dim() == 1:
+                    draft_tokens = draft_tokens.unsqueeze(0)
+                assert draft_tokens.shape[0] == x.shape[0], "draft_tokens batch size mismatch"
+                draft_len = draft_tokens.shape[1]
+                assert draft_len <= gen_length, "draft_tokens length must be <= gen_length"
+
+                draft_embeds = self.model.model.embed_tokens(draft_tokens).to(x_embeds.dtype)
+                gen_start = inputs_embeds.shape[1]
+                gen_end = gen_start + draft_len
+                x[:, gen_start:gen_end] = draft_tokens
+                x_embeds[:, gen_start:gen_end] = draft_embeds
+            # --- FIM draft support end ---
 
             # Prompt index tracking
             prompt_index = torch.zeros((1, total_length), dtype=torch.bool, device=inputs_embeds.device)
@@ -280,7 +298,8 @@ class FastDLLMGenerationHook:
                             inputs_embeds=combined_embeds,
                             fast_dllm_cache=fast_dllm_cache
                         )
-                        logits = self.model.lm_head(outputs[0]).float()
+                        # logits = self.model.lm_head(outputs[0]).float()
+                        logits = self.model.lm_head(outputs[0])
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
@@ -396,7 +415,8 @@ class FastDLLMGenerationHook:
         x0 = torch.argmax(logits_with_noise, dim=-1)
 
         if remasking == 'low_confidence':
-            p = F.softmax(logits.to(torch.float64), dim=-1)
+            # p = F.softmax(logits.to(torch.float64), dim=-1)
+            p = F.softmax(logits, dim=-1)
             x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
         elif remasking == 'random':
             x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)

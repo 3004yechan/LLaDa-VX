@@ -41,7 +41,7 @@ import transformers
 import tokenizers
 import deepspeed
 
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoModelForCausalLM
 from torch.utils.data import Dataset
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
 from llava.train.llava_trainer import LLaVATrainer
@@ -64,6 +64,7 @@ warnings.filterwarnings("ignore")
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     model_class_name: Optional[str] = field(default=None, metadata={"help": "Used to init model class, format is XXXXForCausalLM. e.g. currently XXXX is chosen from LlavaLlama, LlavaMixtral, LlavaMistral, Llama"})
+    device_map: Optional[str] = field(default=None, metadata={"help": "JSON string passed to from_pretrained(device_map=...). Example: \"{'':0}\" for single GPU."})
 
     mm_tunable_parts: Optional[str] = field(
         default=None, metadata={"help": 'Could be "mm_mlp_adapter", "mm_vision_resampler", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_vision_tower,mm_mlp_adapter,mm_language_model", "mm_mlp_adapter,mm_language_model"'}
@@ -141,6 +142,8 @@ class DataArguments:
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
+    use_fimx_dataset: bool = field(default=False, metadata={"help": "Use LazySupervisedDatasetForFIMX for FIM-style single-turn data."})
+    fimx_answer_block_size: int = field(default=20, metadata={"help": "Answer block size for FIMX dataset (prefix+answer+optional explanation)."})
 
 
 @dataclass
@@ -174,6 +177,8 @@ class TrainingArguments(transformers.TrainingArguments):
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
     use_conversation_mask: bool=field(default=True)
+    enable_complementary_masking: bool = field(default=False, metadata={"help": "Enable complementary masking (mask + inverse mask) for diffusion LM training."})
+    enable_semi_complementary_masking: bool = field(default=False, metadata={"help": "Enable semi-complementary masking (answer always masked, prefix/because never masked, complementary only on explanation) for FIMX data."})
 
 
 # @dataclass
@@ -1513,6 +1518,192 @@ class LazySupervisedDataset(Dataset):
 
         return data_dict
 
+class LazySupervisedDatasetForFIMX(Dataset):
+    """
+    Simplified dataset loader tailored for FIM-style single-turn, image-only JSON data.
+    """
+
+    RESERVED_SLOT_TOKEN = "<|reserved_token_1|>"
+
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer: transformers.PreTrainedTokenizer,
+        data_args: DataArguments,
+        answer_block_size: int = 20,
+    ):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.data_args = data_args
+        self.answer_block_size = answer_block_size
+
+        self._reserved_token_id = self.tokenizer.convert_tokens_to_ids(self.RESERVED_SLOT_TOKEN)
+        if self._reserved_token_id is None:
+            raise ValueError(f"Tokenizer is missing {self.RESERVED_SLOT_TOKEN} token.")
+        if self.answer_block_size <= 0:
+            raise ValueError("answer_block_size must be a positive integer.")
+
+        if not data_path.endswith(".json"):
+            raise ValueError("LazySupervisedDatasetForFIMX currently supports only JSON files.")
+
+        with open(data_path, "r") as f:
+            payload = json.load(f)
+
+        if isinstance(payload, dict):
+            # Allow dict keyed by sample id.
+            payload = list(payload.values())
+        elif not isinstance(payload, list):
+            raise ValueError(f"Unsupported JSON structure: {type(payload)}")
+
+        self.list_data_dict = payload
+
+    def __len__(self) -> int:
+        return len(self.list_data_dict)
+
+    @property
+    def lengths(self):
+        """Match LazySupervisedDataset API for sampler."""
+        length_list = []
+        for sample in self.list_data_dict:
+            img_tokens = 128 if "image" in sample else 0
+            cur_len = sum(len(conv["value"].split()) for conv in sample.get("conversations", []))
+            length_list.append(cur_len + img_tokens)
+        return length_list
+
+    @property
+    def modality_lengths(self):
+        """Match LazySupervisedDataset API for sampler."""
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv["value"].split()) for conv in sample.get("conversations", []))
+            if cur_len == 0:
+                raise ValueError("Conversation length is 0 for a sample; check data formatting.")
+            if "image" in sample or "video" in sample or getattr(self.data_args, "early_mix_text", False):
+                length_list.append(cur_len)
+            else:
+                length_list.append(-cur_len)
+        return length_list
+
+    def _process_image(self, image_file: str):
+        image_folder = self.data_args.image_folder
+        if not image_folder:
+            raise ValueError("image_folder must be set in data_args for FIMX dataset.")
+
+        image_path = os.path.join(image_folder, image_file)
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+
+        image = Image.open(image_path).convert("RGB")
+        image_size = image.size
+
+        aspect = self.data_args.image_aspect_ratio
+        if aspect == "highres":
+            pixel_values = process_highres_image(image, self.data_args.image_processor, self.data_args.image_grid_pinpoints)
+        elif aspect == "anyres" or (aspect and "anyres_max" in aspect):
+            pixel_values = process_anyres_image(image, self.data_args.image_processor, self.data_args.image_grid_pinpoints)
+        elif aspect == "crop_split":
+            pixel_values = process_highres_image_crop_split(image, self.data_args)
+        elif aspect == "pad":
+            def expand2square(pil_img, background_color):
+                w, h = pil_img.size
+                if w == h:
+                    return pil_img
+                if w > h:
+                    result = Image.new(pil_img.mode, (w, w), background_color)
+                    result.paste(pil_img, (0, (w - h) // 2))
+                    return result
+                result = Image.new(pil_img.mode, (h, h), background_color)
+                result.paste(pil_img, ((h - w) // 2, 0))
+                return result
+
+            image = expand2square(image, tuple(int(x * 255) for x in self.data_args.image_processor.image_mean))
+            pixel_values = self.data_args.image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+        else:
+            pixel_values = self.data_args.image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+
+        return pixel_values, image_size, "image"
+
+    def _tokenize(self, sample: Dict) -> Dict[str, torch.Tensor]:
+        has_image = "image" in sample
+        if has_image:
+            sources = preprocess_multimodal(copy.deepcopy([sample["conversations"]]), self.data_args)
+        else:
+            sources = copy.deepcopy([sample["conversations"]])
+        tokenized = preprocess(sources, self.tokenizer, has_image=has_image)
+        return tokenized
+
+    def _build_label_ids(self, sample: Dict) -> List[int]:
+        answer = sample.get("answer") or sample.get("answers") or ""
+        answer = answer.strip()
+
+        prefix_ids = self.tokenizer("The answer is ", add_special_tokens=False).input_ids
+        answer_ids = self.tokenizer(answer, add_special_tokens=False).input_ids if answer else []
+
+        block_ids = [self._reserved_token_id] * self.answer_block_size
+        copy_len = min(len(prefix_ids), self.answer_block_size)
+        block_ids[:copy_len] = prefix_ids[:copy_len]
+
+        remaining = self.answer_block_size - copy_len
+        if remaining > 0 and answer_ids:
+            ans_copy_len = min(len(answer_ids), remaining)
+            block_ids[copy_len : copy_len + ans_copy_len] = answer_ids[:ans_copy_len]
+
+        explanation = sample.get("explanation") or ""
+        if isinstance(explanation, list):
+            explanation = explanation[0] if explanation else ""
+        explanation = explanation.strip()
+        if explanation:
+            explanation = explanation
+            if explanation[-1] not in ".!?":
+                explanation = explanation + "."
+
+        explanation_ids: List[int] = []
+        if explanation:
+            # Add leading+trailing space so answer and explanation don't glue
+            because_ids = self.tokenizer(" because ", add_special_tokens=False).input_ids
+            explanation_body_ids = self.tokenizer(explanation, add_special_tokens=False).input_ids
+            explanation_ids = because_ids + explanation_body_ids
+
+        return block_ids + explanation_ids
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        sample = copy.deepcopy(self.list_data_dict[index])
+
+        if "conversations" not in sample or len(sample["conversations"]) < 2:
+            raise ValueError("Each sample must contain at least a human and assistant turn in 'conversations'.")
+
+        label_ids = self._build_label_ids(sample)
+        label_text = self.tokenizer.decode(
+            label_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        sample["conversations"][1]["value"] = label_text
+
+        data_dict = self._tokenize(sample)
+
+        # `_tokenize` returns tensors with an extra batch dim (1, seq); squeeze to 1D like the base dataset.
+        if "input_ids" in data_dict and data_dict["input_ids"].dim() == 2 and data_dict["input_ids"].size(0) == 1:
+            data_dict["input_ids"] = data_dict["input_ids"][0]
+        if "labels" in data_dict and data_dict["labels"].dim() == 2 and data_dict["labels"].size(0) == 1:
+            data_dict["labels"] = data_dict["labels"][0]
+
+        if "image" in sample:
+            image_entry = self._process_image(sample["image"])
+            data_dict["image"] = [image_entry]
+
+        data_dict["id"] = sample.get("id", index)
+
+        # Flags consumed downstream (matching LazySupervisedDataset behaviour).
+        if conversation_lib.default_conversation.version == "llada_plain":
+            data_dict["is_plain"] = True
+            data_dict["is_llada"] = True
+        elif conversation_lib.default_conversation.version == "llava_llada":
+            data_dict["is_plain"] = False
+            data_dict["is_llada"] = True
+
+        return data_dict
+
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
@@ -1537,6 +1728,9 @@ class DataCollatorForSupervisedDataset(object):
         if self.tokenizer.pad_token_id is None:
             # self.tokenizer.pad_token_id = self.tokenizer.eos_token_id  # FIXME: this could only be triggered for llama3 model.
             self.tokenizer.pad_token_id = 0 # This gets the best result. Don't know why.
+        # Ensure pad_token_id is non-negative (some configs use -200); fallback to eos if needed.
+        if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id < 0:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id or 0
 
         if "is_llada" in instances[0] and instances[0]["is_llada"]:
             # Pad the sequence with the pad token id
@@ -1589,6 +1783,14 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
             data_path=data_args.data_path,
             data_args=data_args
         )
+    elif getattr(data_args, "use_fimx_dataset", False):
+        rank0_print("Loading data using FIMX JSON dataset")
+        train_dataset = LazySupervisedDatasetForFIMX(
+            tokenizer=tokenizer,
+            data_path=data_args.data_path,
+            data_args=data_args,
+            answer_block_size=getattr(data_args, "fimx_answer_block_size", 20),
+        )
     else:
         rank0_print("Loading data using traditional JSON format")
         train_dataset = LazySupervisedDataset(
@@ -1608,7 +1810,16 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     customized_kwargs = dict()
     customized_kwargs.update(bnb_model_from_pretrained_args)
-    cfg_pretrained = None
+    cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
+
+    # Optional manual device_map override (useful for 4bit to avoid meta tensors with auto device placement)
+    if model_args.device_map:
+        try:
+            customized_kwargs["device_map"] = json.loads(model_args.device_map)
+        except Exception as exc:
+            raise ValueError(f"Failed to parse device_map JSON string: {model_args.device_map}") from exc
+        # device_map requires low_cpu_mem_usage=True when dispatching with accelerate
+        customized_kwargs.setdefault("low_cpu_mem_usage", True)
 
     overwrite_config = {}
     if any(
@@ -1651,12 +1862,12 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         overwrite_config["mm_spatial_pool_mode"] = model_args.mm_spatial_pool_mode
 
     if overwrite_config:
-        assert cfg_pretrained is not None, "cfg_pretrained is None"
-
         rank0_print(f"Overwriting config with {overwrite_config}")
         for k, v in overwrite_config.items():
             setattr(cfg_pretrained, k, v)
 
+        customized_kwargs["config"] = cfg_pretrained
+    else:
         customized_kwargs["config"] = cfg_pretrained
 
     if model_args.model_class_name is not None:
@@ -1668,7 +1879,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             cache_dir=training_args.cache_dir,
             attn_implementation=training_args.attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-            low_cpu_mem_usage=False,
             **customized_kwargs,
         )
     elif model_args.vision_tower is not None:
@@ -1678,7 +1888,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
                 **customized_kwargs,
             )
             from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
@@ -1690,7 +1899,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
                 **customized_kwargs,
             )
         elif (
@@ -1706,7 +1914,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
                 **customized_kwargs,
             )
         elif "qwen" in model_args.model_name_or_path.lower():
@@ -1716,7 +1923,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                     cache_dir=training_args.cache_dir,
                     attn_implementation=training_args.attn_implementation,
                     torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                    low_cpu_mem_usage=False,
                     **customized_kwargs,
                 )
                 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
@@ -1728,7 +1934,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                     cache_dir=training_args.cache_dir,
                     attn_implementation=training_args.attn_implementation,
                     torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                    low_cpu_mem_usage=False,
                     **customized_kwargs,
                 )
         elif "gemma" in model_args.model_name_or_path.lower():
@@ -1737,18 +1942,27 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
                 **customized_kwargs,
             )
         elif "llada" in model_args.model_name_or_path.lower():
-            model = LlavaLLaDAModelLM.from_pretrained(
-                model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir,
-                attn_implementation=training_args.attn_implementation,
-                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
-                **customized_kwargs,
-            )
+            if getattr(cfg_pretrained, "model_type", "") == "llava_llada":
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_args.model_name_or_path,
+                    cache_dir=training_args.cache_dir,
+                    attn_implementation=training_args.attn_implementation,
+                    torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                    trust_remote_code=True,
+                    **customized_kwargs,
+                )
+            else:
+                model = LlavaLLaDAModelLM.from_pretrained(
+                    model_args.model_name_or_path,
+                    cache_dir=training_args.cache_dir,
+                    attn_implementation=training_args.attn_implementation,
+                    torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                    trust_remote_code=True,
+                    **customized_kwargs,
+                )
         else:
             raise ValueError(f"Unknown model class {model_args}")
     else:
@@ -1757,7 +1971,6 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             cache_dir=training_args.cache_dir,
             attn_implementation=training_args.attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-            low_cpu_mem_usage=False,
             **customized_kwargs,
         )
     return model
@@ -1785,9 +1998,6 @@ def train(attn_implementation=None):
 
         bnb_model_from_pretrained_args.update(
             dict(
-                device_map={"": training_args.device},
-                load_in_4bit=training_args.bits == 4,
-                load_in_8bit=training_args.bits == 8,
                 quantization_config=BitsAndBytesConfig(
                     load_in_4bit=training_args.bits == 4,
                     load_in_8bit=training_args.bits == 8,
@@ -1969,10 +2179,12 @@ def train(attn_implementation=None):
             tunable_parts = model_args.mm_tunable_parts.split(",")
             if "mm_mlp_adapter" in tunable_parts:
                 for p in model.get_model().mm_projector.parameters():
-                    p.requires_grad = True
+                    if p.is_floating_point() or p.is_complex():
+                        p.requires_grad = True
             if "mm_vision_resampler" in tunable_parts:
                 for p in model.get_model().vision_resampler.parameters():
-                    p.requires_grad = True
+                    if p.is_floating_point() or p.is_complex():
+                        p.requires_grad = True
             if "mm_vision_tower" in tunable_parts:
                 for name, param in model.named_parameters():
                     if "vision_tower" in name:
@@ -1980,6 +2192,12 @@ def train(attn_implementation=None):
             if "mm_language_model" in tunable_parts:
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
+                        if param.is_floating_point() or param.is_complex():
+                            param.requires_grad_(True)
+            # If using LoRA, ensure LoRA params stay trainable even when LM base is frozen
+            if training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "lora_" in name:
                         param.requires_grad_(True)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
@@ -1995,6 +2213,14 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+        # Toggle complementary masking (mask + inverse mask) if requested.
+        model.config.enable_complementary_masking = training_args.enable_complementary_masking
+        # Semi-complementary masking specific to FIMX-style data.
+        model.config.enable_semi_complementary_masking = training_args.enable_semi_complementary_masking
+        if getattr(data_args, "use_fimx_dataset", False):
+            model.config.fimx_answer_block_size = getattr(data_args, "fimx_answer_block_size", 20)
+            model.config.fimx_ans_prefix_len = len(tokenizer("The answer is", add_special_tokens=False).input_ids)
+        model.config.fimx_because_prefix_len = len(tokenizer(" because", add_special_tokens=False).input_ids)
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

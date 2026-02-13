@@ -21,25 +21,35 @@ import warnings
 prompt_interval_steps = 25
 gen_interval_steps = 7
 transfer_ratio = 0.25
+
 use_fast_dllm = False  # using fast-dLLM (https://github.com/NVlabs/Fast-dLLM) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 6s to generate 128 tokens.
 use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cache) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 25s to generate 128 tokens.
 
 warnings.filterwarnings("ignore")
-pretrained = "/home/20223206/model/LLaDA-V-HF"
+warnings.filterwarnings("ignore")
+# pretrained = "GSAI-ML/LLaDA-V"
+pretrained = "./exp/llada_v_qlora_single"
+model_base = "/home/20223206/model/LLaDA-V-HF"
 
-model_name = "llava_llada"
+model_name = "llava_llada_lora"
 device = "cuda:0"
 device_map = "cuda:0"
-tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, attn_implementation="sdpa", device_map=device_map, load_4bit=True)  # Add any other thing you want to pass in llava_model_args
+# tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, attn_implementation="sdpa", device_map=device_map, load_8bit=True)  # Add any other thing you want to pass in llava_model_args
+tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, model_base, model_name, attn_implementation="sdpa", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 
 model.eval()
-image = Image.open("test.jpg")
+image = Image.open("tennis.jpg")
 image_tensor = process_images([image], image_processor, model.config)
 image_tensor = [_image.to(dtype=torch.float16, device=device) for _image in image_tensor]
 
 conv_template = "llava_llada"
+# question = DEFAULT_IMAGE_TOKEN + "\nPlease describe the image in detail."
 question = DEFAULT_IMAGE_TOKEN + "\nWhat activity is the person (or people) performing in this image?"
-# question = DEFAULT_IMAGE_TOKEN + "\nWhat she Doing? Explain why."
+
+FIM = '<|reserved_token_1|>'
+# FIM = ''
+# draft_answer = f'''Because{"<|mdm_mask|>"*15}, the answer is{"<|mdm_mask|>"*4}.<|eot_id|>'''
+draft_answer = f'''The answer is{"<|mdm_mask|>"*17} because{"<|mdm_mask|>"*50}<|eot_id|>'''
 
 conv = copy.deepcopy(conv_templates[conv_template])
 conv.append_message(conv.roles[0], question)
@@ -68,14 +78,22 @@ else:
 input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
 image_sizes = [image.size]
 
+# Use string stop token so tokenizer.encode receives text (the generate loop will tokenize internally).
+# stop_tokens = ["<|eot_id|>"]
+stop_tokens = None
+
+# draft_tokens = tokenizer(draft_answer,return_tensors='pt').input_ids.to(device) 
+draft_tokens = tokenizer(draft_answer,return_tensors='pt').to(input_ids.device).input_ids
+
 start_time = time.time()
 cont = model.generate(
     input_ids,
     images=image_tensor,
     image_sizes=image_sizes,
-    steps=128, gen_length=128, block_length=128, tokenizer=tokenizer, stopping_criteria=['<|eot_id|>'], 
+    steps=128, gen_length=128, block_length=128, tokenizer=tokenizer, stopping_criteria=stop_tokens, #['<|eot_id|>']
     prefix_refresh_interval=32,
     threshold=1,
+    draft_tokens=draft_tokens,
 )
 end_time = time.time()
 generation_time = end_time - start_time

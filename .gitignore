@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Notebook / editor cache
+.ipynb_checkpoints/
+
+# Training outputs
+train/exp/
+train/exp_trash/
+wandb/
+runs/
+*.log
+
+# Local datasets
+tools/*.json
+
+# OS artifacts
+.DS_Store

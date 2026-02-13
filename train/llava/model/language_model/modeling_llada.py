@@ -49,6 +49,7 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
+from llava.constants import IMAGE_TOKEN_INDEX
 from .configuration_llada import LLaDAConfig
 from llava.cache import dLLMCache, dLLMCacheConfig
 
@@ -1235,7 +1236,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
     @ torch.no_grad()
     def generate(self, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                cfg_scale=0., remasking='low_confidence', mask_id=126336):
+                cfg_scale=0., remasking='low_confidence', mask_id=126336, draft_tokens=None):
         '''
         Args:
             prompt: A tensor of shape (1, l).
@@ -1249,6 +1250,15 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         '''
         x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(prompt.device)
         x[:, :prompt.shape[1]] = prompt.clone()
+
+        # === Draft token seeding (added) ===
+        if draft_tokens is not None:
+            draft_tokens = draft_tokens.to(x.device)
+            assert draft_tokens.dim() == 2, "draft_tokens should be 2D (batch, length)"
+            assert draft_tokens.shape[0] == x.shape[0], "draft_tokens batch size mismatch"
+            assert draft_tokens.shape[1] <= gen_length, "draft_tokens length must be <= gen_length"
+            x[:, prompt.shape[1]:prompt.shape[1] + draft_tokens.shape[1]] = draft_tokens
+        # === End draft token seeding ===
 
         prompt_index = (x != mask_id)
 
@@ -1277,7 +1287,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
 
                 if remasking == 'low_confidence':
-                    p = F.softmax(logits.to(torch.float64), dim=-1)
+                    # p = F.softmax(logits.to(torch.float64), dim=-1)
+                    p = F.softmax(logits, dim=-1)
                     x0_p = torch.squeeze(
                         torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
                 elif remasking == 'random':
@@ -1300,7 +1311,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
     @torch.no_grad()
     def generate_with_embeds(self, inputs_embeds, steps=128, gen_length=128, block_length=128, temperature=0.,
-        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, stopping_criteria=None, generation_suffix=None, **kwargs):
+        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, stopping_criteria=None,
+        generation_suffix=None, draft_tokens=None, **kwargs):
         '''
         Args:
             inputs_embeds: A tensor of shape (1, l, d).
@@ -1334,13 +1346,27 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             masked_embed = self.model.embed_tokens(torch.tensor([mask_id]).to(inputs_embeds.device)) # shape (1, d)
             x_embeds = masked_embed.repeat(1, total_length, 1).to(inputs_embeds.device) # shape (1, l + gen_length + suffix_len, d)
             x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds.clone()
-            if suffix_embeds is not None:
-                x_embeds[:, -suffix_len:] = suffix_embeds
 
             # Create a tracking tensor for token IDs for final output
             x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
             if suffix_token_ids is not None:
                 x[:, -suffix_len:] = suffix_token_ids
+
+            # === Draft token seeding (added) ===
+            if draft_tokens is not None:
+                draft_tokens = draft_tokens.to(x.device)
+                assert draft_tokens.dim() == 2, "draft_tokens should be 2D (batch, length)"
+                assert draft_tokens.shape[0] == x.shape[0], "draft_tokens batch size mismatch"
+                assert draft_tokens.shape[1] <= gen_length, "draft_tokens length must be <= gen_length"
+                draft_embeds = self.model.embed_tokens(draft_tokens).to(x_embeds.dtype)
+                gen_start = inputs_embeds.shape[1]
+                gen_end = gen_start + draft_tokens.shape[1]
+                x[:, gen_start:gen_end] = draft_tokens
+                x_embeds[:, gen_start:gen_end] = draft_embeds
+            # === End draft token seeding ===
+
+            if suffix_embeds is not None:
+                x_embeds[:, -suffix_len:] = suffix_embeds
 
             # prompt_index: A tensor of shape (1, l + gen_length + suffix_len) where the first l elements are 1 (representing the prompt) 
             # and the remaining gen_length+suffix_len elements are 0 (representing the generated part)
@@ -1407,7 +1433,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         
                         # Forward pass
                         outputs = self.model(inputs_embeds=combined_embeds)
-                        logits = self.lm_head(outputs[0]).float()
+                        # logits = self.lm_head(outputs[0]).float()
+                        logits = self.lm_head(outputs[0])
                         
                         # Split and apply CFG
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
@@ -1415,7 +1442,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     else:
                         # Forward pass
                         outputs = self.model(inputs_embeds=x_embeds)
-                        logits = self.lm_head(outputs[0]).float()
+                        # logits = self.lm_head(outputs[0]).float()
+                        logits = self.lm_head(outputs[0])
                     
                     for token_id in [126081, 126080, 126346, 126347]:
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
@@ -1426,7 +1454,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     
                     # Get confidence scores
                     if remasking == 'low_confidence':
-                        p = F.softmax(logits.to(torch.float64), dim=-1) # shape (1, l + gen_length + suffix_len, vocab_size)
+                        # --- LLaDA-VX: precision tweak (for lower peak memory). See self.add_gumbel_noise ---
+                        # p = F.softmax(logits.to(torch.float64), dim=-1)
+                        p = F.softmax(logits, dim=-1) # shape (1, l + gen_length + suffix_len, vocab_size)
                         x0_p = torch.squeeze(
                             torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # 1, l + gen_length + suffix_len represents the confidence of each x0
                     elif remasking == 'random':
@@ -1540,6 +1570,139 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Sanity check token id range before embedding.
+        if input_ids is not None:
+            # Flatten any extra dims on input_ids (e.g., [b, 1, seq]) for validation.
+            if input_ids.dim() > 2:
+                input_ids = input_ids.view(input_ids.size(0), -1)
+            vocab_size = self.lm_head.weight.shape[0]
+            image_mask = input_ids == IMAGE_TOKEN_INDEX
+            ids_for_check = torch.where(image_mask, torch.zeros_like(input_ids), input_ids)
+            max_id = int(ids_for_check.max().item())
+            min_id = int(ids_for_check.min().item())
+            if max_id >= vocab_size or min_id < 0:
+                # Clamp out-of-range ids to pad token and continue (avoid CUDA assert).
+                pad_id = self.model.embed_tokens.padding_idx or 0
+                ids_for_check = ids_for_check.clamp(min=0, max=vocab_size - 1)
+                if min_id < 0:
+                    ids_for_check[ids_for_check < 0] = pad_id
+                # Restore image sentinel after clamping.
+                ids_for_check[image_mask] = IMAGE_TOKEN_INDEX
+                input_ids = ids_for_check
+                print(
+                    f"[WARN] input_ids out of range corrected: min={min_id}, max={max_id}, "
+                    f"vocab_size={vocab_size}, shape={tuple(input_ids.shape)}"
+                )
+
+        # If only input_ids are provided, build embeddings here so downstream masking logic has tensors.
+        if inputs_embeds is None and input_ids is not None:
+            pad_id = self.model.embed_tokens.padding_idx or 0
+            input_ids_for_embed = input_ids
+            if (input_ids_for_embed == IMAGE_TOKEN_INDEX).any():
+                input_ids_for_embed = input_ids_for_embed.masked_fill(input_ids_for_embed == IMAGE_TOKEN_INDEX, pad_id)
+            inputs_embeds = self.model.embed_tokens(input_ids_for_embed)
+            # To avoid passing both ids and embeds downstream (LLaDA base model forbids both), drop input_ids.
+            input_ids = None
+
+        # Some multimodal paths may leave an extra dimension (e.g., stacked views). Flatten to (b, seq, d).
+        if inputs_embeds is not None and inputs_embeds.dim() > 3:
+            b, *mid, d = inputs_embeds.shape
+            inputs_embeds = inputs_embeds.view(b, -1, d)
+            if labels is not None and labels.dim() > 2:
+                labels = labels.view(b, -1)
+            if attention_mask is not None and attention_mask.dim() > 2:
+                attention_mask = attention_mask.view(b, -1)
+            if position_ids is not None and position_ids.dim() > 2:
+                position_ids = position_ids.view(b, -1)
+        # Also flatten labels/attn/pos if they accidentally carry an extra dimension.
+        if labels is not None and labels.dim() > 2:
+            b = labels.size(0)
+            labels = labels.view(b, -1)
+        if attention_mask is not None and attention_mask.dim() > 2:
+            b = attention_mask.size(0)
+            attention_mask = attention_mask.view(b, -1)
+        if position_ids is not None and position_ids.dim() > 2:
+            b = position_ids.size(0)
+            position_ids = position_ids.view(b, -1)
+
+        # Validate label range early to surface issues before CUDA kernels.
+        if labels is not None:
+            labels_valid = labels != -100
+            if labels_valid.any():
+                vocab_size = self.lm_head.weight.shape[0]
+                max_label = int(labels[labels_valid].max().item())
+                min_label = int(labels[labels_valid].min().item())
+                if max_label >= vocab_size or min_label < 0:
+                    raise ValueError(
+                        f"Label ids out of range: min={min_label}, max={max_label}, vocab_size={vocab_size}, "
+                        f"shape={tuple(labels.shape)}"
+                    )
+
+
+        def apply_semi_complementary_masking(input_embeds, labels, attention_mask, position_ids, input_ids, conversation_ids):
+            b, l, d = input_embeds.shape
+            device = input_embeds.device
+
+            label_mask = labels != -100
+            has_target = label_mask.any(dim=1, keepdim=True)
+            # First valid position of assistant tokens per sample.
+            start_idx = torch.argmax(label_mask.float(), dim=1, keepdim=True)
+
+            block_len = getattr(self.config, "fimx_answer_block_size", 0)
+            ans_prefix_len = getattr(self.config, "fimx_ans_prefix_len", 0)
+            because_prefix_len = getattr(self.config, "fimx_because_prefix_len", 0)
+
+            positions = torch.arange(l, device=device).unsqueeze(0).expand(b, -1)
+
+            block_end = start_idx + block_len
+            prefix_end = torch.minimum(start_idx + ans_prefix_len, block_end)
+
+            block_mask = (positions >= start_idx) & (positions < block_end) & label_mask & has_target
+            prefix_mask = (positions >= start_idx) & (positions < prefix_end) & label_mask & has_target
+            answer_mask = block_mask & (~prefix_mask)
+
+            because_start = block_end
+            because_end = because_start + because_prefix_len
+            because_mask = (positions >= because_start) & (positions < because_end) & label_mask & has_target
+            explanation_mask = label_mask & (positions >= because_end) & has_target
+
+            eps = 1e-3
+            # Per-sample masking probability to mimic original behaviour.
+            base_prob = (1 - eps) * torch.rand((b, 1), device=device) + eps
+            prob_matrix = base_prob.expand(-1, l)
+            rand_vals = torch.rand((b, l), device=device)
+            explanation_rand_mask = explanation_mask & (rand_vals < prob_matrix)
+
+            primary_mask = answer_mask | explanation_rand_mask
+            complementary_mask = answer_mask | (explanation_mask & (~explanation_rand_mask))
+
+            mask_token_id = torch.tensor([126336], device=device)
+            masked_embed = self.model.embed_tokens(mask_token_id)
+            masked_embed_expanded = masked_embed.view(1, 1, -1)
+
+            noisy_embeds = torch.where(primary_mask.unsqueeze(-1), masked_embed_expanded, input_embeds)
+            p_mask = torch.ones_like(labels, dtype=torch.float, device=device)
+            p_mask = torch.where(explanation_mask, prob_matrix, p_mask)
+
+            masked_indices = primary_mask
+
+            # Only add complementary view if explanation exists anywhere in batch.
+            if explanation_mask.any():
+                comp_embeds = torch.where(complementary_mask.unsqueeze(-1), masked_embed_expanded, input_embeds)
+                noisy_embeds = torch.cat([noisy_embeds, comp_embeds], dim=0)
+                labels = torch.cat([labels, labels.clone()], dim=0)
+                p_mask = torch.cat([p_mask, p_mask], dim=0)
+                masked_indices = torch.cat([masked_indices, complementary_mask], dim=0)
+                if attention_mask is not None:
+                    attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
+                if conversation_ids is not None:
+                    conversation_ids = torch.cat([conversation_ids, conversation_ids], dim=0)
+                if input_ids is not None:
+                    input_ids = torch.cat([input_ids, input_ids], dim=0)
+                if position_ids is not None:
+                    position_ids = torch.cat([position_ids, position_ids], dim=0)
+
+            return noisy_embeds, p_mask, masked_embed, masked_indices, labels, attention_mask, position_ids, input_ids, conversation_ids
 
         def forward_process_embeds(input_embeds, labels, eps=1e-3):
             b, l, d = input_embeds.shape
@@ -1558,9 +1721,40 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
             return noisy_embeds, p_mask, masked_embed
 
-        noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
-        
-        masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
+        use_semi_cm = (
+            getattr(self.config, "enable_semi_complementary_masking", False)
+            and labels is not None
+            and getattr(self.config, "fimx_answer_block_size", None) is not None
+        )
+
+        if use_semi_cm:
+            noisy_embeds, p_mask, masked_embed, masked_indices, labels, attention_mask, position_ids, input_ids, conversation_ids = apply_semi_complementary_masking(
+                inputs_embeds, labels, attention_mask, position_ids, input_ids, conversation_ids
+            )
+        else:
+            noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
+            
+            masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
+            # Optionally duplicate the batch with the complementary mask so every token is supervised once.
+            if getattr(self.config, "enable_complementary_masking", False) and labels is not None:
+                labels_mask = labels != -100
+                complementary_mask = (~masked_indices) & labels_mask
+                if complementary_mask.any():
+                    masked_embed_expanded = masked_embed.view(1, 1, -1)
+                    complementary_embeds = torch.where(complementary_mask.unsqueeze(-1), masked_embed_expanded, inputs_embeds)
+                    noisy_embeds = torch.cat([noisy_embeds, complementary_embeds], dim=0)
+                    labels = torch.cat([labels, labels.clone()], dim=0)
+                    p_mask = torch.cat([p_mask, p_mask], dim=0)
+                    masked_indices = torch.cat([masked_indices, complementary_mask], dim=0)
+                    if attention_mask is not None:
+                        attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
+                    if conversation_ids is not None:
+                        conversation_ids = torch.cat([conversation_ids, conversation_ids], dim=0)
+                    if input_ids is not None:
+                        input_ids = torch.cat([input_ids, input_ids], dim=0)
+                    if position_ids is not None:
+                        position_ids = torch.cat([position_ids, position_ids], dim=0)
+
         prompt_index = (labels == -100).to(torch.int64) # shape (b, l)
         
         noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)

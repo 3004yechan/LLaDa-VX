@@ -30,7 +30,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     if load_8bit:
         kwargs["load_in_8bit"] = True
     elif load_4bit:
-        kwargs["load_in_4bit"] = True
+        #kwargs["load_in_4bit"] = True
         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
     elif torch_dtype == "float16":
         kwargs["torch_dtype"] = torch.float16
@@ -57,6 +57,19 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             )
         if "lora" in model_name.lower() and model_base is not None:
             lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
+            # LoRA checkpoints trained with 4bit can carry a saved quantization_config.
+            # When we load the base model (typically FP16) and quantize on-the-fly via BitsAndBytesConfig,
+            # the baked config can trigger HF to expect pre-quantized weights and crash.
+            if hasattr(lora_cfg_pretrained, "quantization_config"):
+                lora_cfg_pretrained.quantization_config = None
+                # Some configs also carry the field name in the internal dict; remove it to stop HF auto-quantization.
+                try:
+                    del lora_cfg_pretrained.__dict__["quantization_config"]
+                except Exception:
+                    pass
+            # Make sure we do not pass an accidental quantization_config through kwargs when not explicitly requested.
+            if not load_4bit and not load_8bit:
+                kwargs.pop("quantization_config", None)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             rank0_print("Loading LLaVA from base model...")
             if "mixtral" in model_name.lower():
@@ -77,6 +90,12 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 lora_cfg_pretrained = LlavaGemmaConfig.from_pretrained(model_path)
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+            elif "llada" in model_name.lower():
+                from llava.model.language_model.llava_llada import LlavaLLaDAConfig, LlavaLLaDAModelLM
+
+                lora_cfg_pretrained = LlavaLLaDAConfig.from_pretrained(model_path)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                model = LlavaLLaDAModelLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             else:
                 from llava.model.language_model.llava_llama import LlavaConfig
 
@@ -110,8 +129,20 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
             rank0_print("Loading LoRA weights...")
             model = PeftModel.from_pretrained(model, model_path)
-            rank0_print("Merging LoRA weights...")
-            model = model.merge_and_unload()
+            merge_lora = True
+            # bitsandbytes 4/8bit + LoRA merge is not supported; keep PEFT modules in that case.
+            if kwargs.get("load_in_8bit") or kwargs.get("load_in_4bit"):
+                merge_lora = False
+            if "quantization_config" in kwargs:
+                qc = kwargs["quantization_config"]
+                if getattr(qc, "load_in_4bit", False) or getattr(qc, "load_in_8bit", False):
+                    merge_lora = False
+
+            if merge_lora:
+                rank0_print("Merging LoRA weights...")
+                model = model.merge_and_unload()
+            else:
+                rank0_print("Keeping LoRA adapters (no merge) due to quantized base.")
             rank0_print("Model is loaded...")
         elif model_base is not None:  # this may be mm projector only, loading projector with preset language mdoel
             rank0_print(f"Loading LLaVA from base model {model_base}...")
@@ -232,7 +263,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
                 model = LlavaGemmaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, config=cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             elif "llada" in model_name.lower():
-                from llava.model.language_model.llava_llada import LlavaLLaDAConfig
+                from llava.model.language_model.llava_llada import LlavaLLaDAConfig, LlavaLLaDAModelLM
 
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
                 if customized_config is None:
