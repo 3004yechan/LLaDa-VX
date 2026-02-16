@@ -25,7 +25,7 @@ use_fast_dllm = False  # using fast-dLLM (https://github.com/NVlabs/Fast-dLLM) t
 use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cache) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 25s to generate 128 tokens.
 
 warnings.filterwarnings("ignore")
-pretrained = "/home/20223206/model/LLaDA-V-HF"
+pretrained = "/workspace/model/LLaDA-V-HF"
 
 model_name = "llava_llada"
 device = "cuda:0"
@@ -33,7 +33,7 @@ device_map = "cuda:0"
 tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, attn_implementation="sdpa", device_map=device_map, load_4bit=True)  # Add any other thing you want to pass in llava_model_args
 
 model.eval()
-image = Image.open("test.jpg")
+image = Image.open("tennis.jpg")
 image_tensor = process_images([image], image_processor, model.config)
 image_tensor = [_image.to(dtype=torch.float16, device=device) for _image in image_tensor]
 

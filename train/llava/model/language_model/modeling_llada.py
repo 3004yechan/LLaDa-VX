@@ -1721,6 +1721,13 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
             return noisy_embeds, p_mask, masked_embed
 
+        # In inference/probing, labels can be None. Build a masking-only label tensor
+        # to keep downstream shape logic valid without enabling supervised loss.
+        labels_for_mask = labels
+        if labels_for_mask is None:
+            b, l, _ = inputs_embeds.shape
+            labels_for_mask = torch.full((b, l), -100, dtype=torch.long, device=inputs_embeds.device)
+
         use_semi_cm = (
             getattr(self.config, "enable_semi_complementary_masking", False)
             and labels is not None
@@ -1731,8 +1738,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             noisy_embeds, p_mask, masked_embed, masked_indices, labels, attention_mask, position_ids, input_ids, conversation_ids = apply_semi_complementary_masking(
                 inputs_embeds, labels, attention_mask, position_ids, input_ids, conversation_ids
             )
+            labels_for_mask = labels
         else:
-            noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels)
+            noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, labels_for_mask)
             
             masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
             # Optionally duplicate the batch with the complementary mask so every token is supervised once.
@@ -1755,7 +1763,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     if position_ids is not None:
                         position_ids = torch.cat([position_ids, position_ids], dim=0)
 
-        prompt_index = (labels == -100).to(torch.int64) # shape (b, l)
+        prompt_index = (labels_for_mask == -100).to(torch.int64) # shape (b, l)
         
         noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
         noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
@@ -1799,9 +1807,32 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         loss = None
         if labels is not None:
             # Change for MDM
-            token_loss = F.cross_entropy(logits[masked_indices], labels[masked_indices], ignore_index=-100,
-                                         reduction='none') / p_mask[masked_indices]
-            loss = torch.sum(token_loss / noisy_data_length[masked_indices]) / labels.shape[0]
+            valid_labels = labels != -100
+            if not valid_labels.any():
+                raise ValueError(
+                    "No supervised label tokens found (all labels are -100). "
+                    "Check dataset preprocessing and conversation template alignment."
+                )
+
+            effective_mask = masked_indices & valid_labels
+            if not effective_mask.any():
+                # Avoid silently training with zero loss when masking degenerates.
+                # Fall back to all valid label positions so training still has signal.
+                effective_mask = valid_labels
+                if not getattr(self, "_warned_empty_mask_once", False):
+                    print(
+                        "[WARN] masked_indices has no supervised positions; "
+                        "falling back to (labels != -100) for loss computation."
+                    )
+                    self._warned_empty_mask_once = True
+
+            token_loss = F.cross_entropy(
+                logits[effective_mask],
+                labels[effective_mask],
+                ignore_index=-100,
+                reduction='none',
+            ) / p_mask[effective_mask]
+            loss = torch.sum(token_loss / noisy_data_length[effective_mask]) / labels.shape[0]
 
         if not return_dict:
             output = (logits,) + outputs[1:]

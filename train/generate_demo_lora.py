@@ -26,8 +26,8 @@ use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cac
 
 warnings.filterwarnings("ignore")
 # pretrained = "GSAI-ML/LLaDA-V"
-pretrained = "./exp/llada_v_qlora_single"
-model_base = "/home/20223206/model/LLaDA-V-HF"
+pretrained = "./exp/llada_v_lora_actx"
+model_base = "/workspace/model/LLaDA-V-HF"
 
 model_name = "llava_llada_lora"
 device = "cuda:0"
@@ -36,12 +36,12 @@ device_map = "cuda:0"
 tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, model_base, model_name, attn_implementation="sdpa", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 
 model.eval()
-image = Image.open("tennis.jpg")
+image = Image.open("/workspace/ACT-X/images/026558760.jpg")
 image_tensor = process_images([image], image_processor, model.config)
 image_tensor = [_image.to(dtype=torch.float16, device=device) for _image in image_tensor]
 
 conv_template = "llava_llada"
-question = DEFAULT_IMAGE_TOKEN + "\nWhat activity is the person (or people) performing in this image?"
+question = DEFAULT_IMAGE_TOKEN + "\nWhat activity is the person (or people) performing in this image? Before you answer, please explain the reason first using the format below: 'Because..., the answer is...'"
 # question = DEFAULT_IMAGE_TOKEN + "\nWhat she Doing? Explain why."
 
 conv = copy.deepcopy(conv_templates[conv_template])
@@ -72,14 +72,8 @@ input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX,
 image_sizes = [image.size]
 
 start_time = time.time()
-# Properly pass stopping criteria as token ids; using raw strings can encode to empty and stop immediately.
-stop_tokens = None
-try:
-    stop_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
-    if stop_id is not None and stop_id != tokenizer.pad_token_id:
-        stop_tokens = [stop_id]
-except Exception:
-    stop_tokens = None
+# LLaDA generate_with_embeds expects stop strings (it tokenizes them internally).
+stop_tokens = None # ["<|eot_id|>"]
 
 cont = model.generate(
     input_ids,

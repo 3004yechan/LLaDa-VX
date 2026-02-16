@@ -1664,7 +1664,11 @@ class LazySupervisedDatasetForFIMX(Dataset):
             explanation_body_ids = self.tokenizer(explanation, add_special_tokens=False).input_ids
             explanation_ids = because_ids + explanation_body_ids
 
-        return block_ids + explanation_ids
+        label_ids = block_ids + explanation_ids
+        eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        if eot_id is not None and eot_id >= 0:
+            label_ids.append(eot_id)
+        return label_ids
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         sample = copy.deepcopy(self.list_data_dict[index])

@@ -61,10 +61,10 @@ def main():
         image_sizes = [image.size]
 
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(args.device)
-        labels = torch.full_like(input_ids, -100)
-
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, images=image_tensor, image_sizes=image_sizes, labels=labels, return_dict=True)
+            # Probe logits without training labels. Passing all -100 labels can trip
+            # strict training-time checks in the model forward path.
+            outputs = model(input_ids=input_ids, images=image_tensor, image_sizes=image_sizes, return_dict=True)
             logits = outputs.logits
         last_logits = logits[0, -1]
         vocab_size = last_logits.size(0)

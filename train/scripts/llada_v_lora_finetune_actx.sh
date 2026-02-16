@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# Single-process LoRA finetune on one GPU (no torchrun/DDP).
+# Single-process LoRA finetune for ACT-X (LazySupervisedDataset path, no FIMX/complementary masking).
 
 set -e
 
 export OMP_NUM_THREADS=8
 export NCCL_DEBUG=WARN
-
-# Optional toggles (set via environment variables before running)
-ENABLE_CM=${ENABLE_CM:-false}            # complementary masking (mask + inverse mask)
-USE_FIMX=${USE_FIMX:-false}              # use LazySupervisedDatasetForFIMX
-FIMX_ANSWER_BLOCK_SIZE=${FIMX_ANSWER_BLOCK_SIZE:-20}  # answer block size for FIMX
-ENABLE_SEMI_CM=${ENABLE_SEMI_CM:-false}  # semi-complementary masking for FIMX
 
 # Optional checkpoint saving controls (env override)
 SAVE_STRATEGY=${SAVE_STRATEGY:-"no"}     # "steps" or "epoch" or "no"
@@ -20,19 +14,17 @@ LOGGING_NAN_INF_FILTER=${LOGGING_NAN_INF_FILTER:-False}
 LLM_VERSION="/workspace/model/LLaDA-V-HF"
 VISION_MODEL_VERSION="model/siglip2-so400m-patch14-384"
 
-# User editable paths
-DATA_PATH="/workspace/ACT-X/actX_train_filled_llada.json"
+# ACT-X LazySupervisedDataset JSON (converted by tools/convert_actx_to_lazy_supervised.py)
+DATA_PATH="/workspace/ACT-X/actX_train_lazy.json"
 IMAGE_FOLDER="/workspace/ACT-X"
 VIDEO_FOLDER=""
 
 PROMPT_VERSION="llava_llada"
-BASE_RUN_NAME="llada_v_lora"
+BASE_RUN_NAME="llada_v_lora_actx"
 
 echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
-echo "ENABLE_CM: ${ENABLE_CM}"
-echo "USE_FIMX: ${USE_FIMX}"
-echo "FIMX_ANSWER_BLOCK_SIZE: ${FIMX_ANSWER_BLOCK_SIZE}"
-echo "ENABLE_SEMI_CM: ${ENABLE_SEMI_CM}"
+echo "DATA_PATH: ${DATA_PATH}"
+echo "IMAGE_FOLDER: ${IMAGE_FOLDER}"
 echo "SAVE_STRATEGY: ${SAVE_STRATEGY}"
 echo "SAVE_INTERVAL: ${SAVE_INTERVAL}"
 echo "LOGGING_NAN_INF_FILTER: ${LOGGING_NAN_INF_FILTER}"
@@ -65,8 +57,8 @@ python llava/train/train_mem.py \
     --output_dir "exp/$BASE_RUN_NAME" \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
-    --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps 8 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 1 \
     --evaluation_strategy "no" \
     --save_strategy "${SAVE_STRATEGY}" \
     --save_steps ${SAVE_INTERVAL} \
@@ -78,7 +70,7 @@ python llava/train/train_mem.py \
     --logging_steps 1 \
     --logging_nan_inf_filter ${LOGGING_NAN_INF_FILTER} \
     --tf32 False \
-    --model_max_length 256 \
+    --model_max_length 4056 \
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
@@ -87,7 +79,7 @@ python llava/train/train_mem.py \
     --dataloader_drop_last True \
     --attn_implementation sdpa \
     --use_conversation_mask False \
-    --enable_complementary_masking ${ENABLE_CM} \
-    --use_fimx_dataset ${USE_FIMX} \
-    --fimx_answer_block_size ${FIMX_ANSWER_BLOCK_SIZE} \
-    --enable_semi_complementary_masking ${ENABLE_SEMI_CM}
+    --enable_complementary_masking False \
+    --use_fimx_dataset False \
+    --enable_semi_complementary_masking False
+

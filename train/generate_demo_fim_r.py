@@ -28,8 +28,8 @@ use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cac
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore")
 # pretrained = "GSAI-ML/LLaDA-V"
-pretrained = "./exp/llada_v_qlora_single"
-model_base = "/home/20223206/model/LLaDA-V-HF"
+pretrained = "./exp/llada_v_lora"
+model_base = "/workspace/model/LLaDA-V-HF"
 
 model_name = "llava_llada_lora"
 device = "cuda:0"
@@ -49,7 +49,7 @@ question = DEFAULT_IMAGE_TOKEN + "\nWhat activity is the person (or people) perf
 FIM = '<|reserved_token_1|>'
 # FIM = ''
 # draft_answer = f'''Because{"<|mdm_mask|>"*15}, the answer is{"<|mdm_mask|>"*4}.<|eot_id|>'''
-draft_answer = f'''The answer is{"<|mdm_mask|>"*17} because{"<|mdm_mask|>"*50}<|eot_id|>'''
+draft_answer = f'''The answer is{"<|mdm_mask|>"*17} because{"<|mdm_mask|>"*30}<|eot_id|>'''
 
 conv = copy.deepcopy(conv_templates[conv_template])
 conv.append_message(conv.roles[0], question)
@@ -80,7 +80,7 @@ image_sizes = [image.size]
 
 # Use string stop token so tokenizer.encode receives text (the generate loop will tokenize internally).
 # stop_tokens = ["<|eot_id|>"]
-stop_tokens = None
+#stop_tokens = None
 
 # draft_tokens = tokenizer(draft_answer,return_tensors='pt').input_ids.to(device) 
 draft_tokens = tokenizer(draft_answer,return_tensors='pt').to(input_ids.device).input_ids
@@ -90,8 +90,8 @@ cont = model.generate(
     input_ids,
     images=image_tensor,
     image_sizes=image_sizes,
-    steps=128, gen_length=128, block_length=128, tokenizer=tokenizer, stopping_criteria=stop_tokens, #['<|eot_id|>']
-    prefix_refresh_interval=32,
+    steps=64, gen_length=64, block_length=1, tokenizer=tokenizer, stopping_criteria=['<|eot_id|>'],
+    prefix_refresh_interval=16,
     threshold=1,
     draft_tokens=draft_tokens,
 )

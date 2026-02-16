@@ -1,14 +1,14 @@
 from llava.train.train import LazySupervisedDatasetForFIMX, DataArguments
 from transformers import AutoTokenizer
 
-model_dir = "/home/20223206/model/LLaDA-V-HF"
-data_path = "/home/20223206/ACT-X/actX_train_llada.json"
+model_dir = "/workspace/model/LLaDA-V-HF"
+data_path = "/workspace/ACT-X/actX_train_filled_llada.json"
 tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
 
 # DataArguments는 최소한 image_folder만 맞춰 주면 됩니다(이미지 안 쓸 때도 필수 필드라 채워야 함).
 data_args = DataArguments(
     data_path=data_path,
-    image_folder="/home/20223206/ACT-X/images",
+    image_folder="/workspace/ACT-X/images",
     image_aspect_ratio="anyres_max_4",
 )
 
