@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="Where to write the filled JSON.")
     parser.add_argument("--tokenizer", type=str, required=True, help="HF tokenizer path or model id.")
     parser.add_argument("--answer-block-size", type=int, default=20, help="Number of reserved tokens to allocate for the answer prefix+text.")
+    parser.add_argument("--explanation-block-size", type=int, default=70, help="Number of reserved tokens to allocate for explanation in --explanation-first mode.")
     parser.add_argument(
         "--reserved-token",
         type=str,
@@ -53,6 +54,11 @@ def parse_args() -> argparse.Namespace:
         "--strip-answer-fields",
         action="store_true",
         help="Drop answer/explanation fields in the output (only keep filled conversations).",
+    )
+    parser.add_argument(
+        "--explanation-first",
+        action="store_true",
+        help="Format assistant turn as: 'Because <explanation>, the answer is <answer>.<|eot_id|>'.",
     )
     return parser.parse_args()
 
@@ -98,7 +104,9 @@ def build_assistant_text(
     answer: str,
     explanation: str,
     answer_block_size: int,
+    explanation_block_size: int,
     reserved_token: str,
+    explanation_first: bool = False,
 ) -> str:
     if answer_block_size <= 0:
         raise ValueError("answer_block_size must be > 0")
@@ -106,6 +114,28 @@ def build_assistant_text(
     reserved_id = tokenizer.convert_tokens_to_ids(reserved_token)
     if reserved_id is None or reserved_id < 0:
         raise ValueError(f"Tokenizer is missing reserved token {reserved_token}")
+
+    if explanation_first:
+        if explanation_block_size <= 0:
+            raise ValueError("explanation_block_size must be > 0")
+        exp = explanation.strip()
+        while exp and exp[-1] in ".!?":
+            exp = exp[:-1].rstrip()
+
+        explanation_ids = tokenizer(exp, add_special_tokens=False).input_ids if exp else []
+        explanation_block_ids = [reserved_id] * explanation_block_size
+        copy_len = min(len(explanation_ids), explanation_block_size)
+        explanation_block_ids[:copy_len] = explanation_ids[:copy_len]
+
+        because_prefix_ids = tokenizer("Because ", add_special_tokens=False).input_ids
+        answer_prefix_ids = tokenizer(", the answer is ", add_special_tokens=False).input_ids
+        answer_ids = tokenizer(answer, add_special_tokens=False).input_ids if answer else []
+        period_ids = tokenizer(".", add_special_tokens=False).input_ids
+        label_ids = because_prefix_ids + explanation_block_ids + answer_prefix_ids + answer_ids + period_ids
+        eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        if eot_id is not None and eot_id >= 0:
+            label_ids.append(eot_id)
+        return tokenizer.decode(label_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
 
     prefix_ids = tokenizer("The answer is ", add_special_tokens=False).input_ids
     answer_ids = tokenizer(answer, add_special_tokens=False).input_ids if answer else []
@@ -136,6 +166,9 @@ def build_assistant_text(
         block_ids.append(reserved_id)
 
     label_ids = block_ids + explanation_ids
+    eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+    if eot_id is not None and eot_id >= 0:
+        label_ids.append(eot_id)
     return tokenizer.decode(label_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
 
 
@@ -143,10 +176,12 @@ def fill_sample(
     sample: Dict[str, Any],
     tokenizer,
     answer_block_size: int,
+    explanation_block_size: int,
     reserved_token: str,
     explanation_field: str,
     answer_field: str,
     strip_answer_fields: bool,
+    explanation_first: bool,
 ) -> Dict[str, Any]:
     if "conversations" not in sample or len(sample["conversations"]) < 2:
         raise ValueError("Sample is missing a 2-turn conversation.")
@@ -165,7 +200,9 @@ def fill_sample(
         answer=answer,
         explanation=explanation,
         answer_block_size=answer_block_size,
+        explanation_block_size=explanation_block_size,
         reserved_token=reserved_token,
+        explanation_first=explanation_first,
     )
 
     conversations = list(sample["conversations"])
@@ -192,10 +229,12 @@ def main() -> None:
                     sample=sample,
                     tokenizer=tokenizer,
                     answer_block_size=args.answer_block_size,
+                    explanation_block_size=args.explanation_block_size,
                     reserved_token=args.reserved_token,
                     explanation_field=args.explanation_field,
                     answer_field=args.answer_field,
                     strip_answer_fields=args.strip_answer_fields,
+                    explanation_first=args.explanation_first,
                 )
             )
         except Exception as exc:  # noqa: BLE001

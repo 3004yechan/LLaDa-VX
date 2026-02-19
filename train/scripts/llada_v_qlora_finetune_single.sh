@@ -6,6 +6,10 @@ set -e
 export OMP_NUM_THREADS=8
 export NCCL_DEBUG=WARN
 
+# FIMX formatting controls
+FIMX_EXPLANATION_FIRST=${FIMX_EXPLANATION_FIRST:-false}  # format labels as "Because ..., the answer is ..."
+FIMX_EXPLANATION_BLOCK_SIZE=${FIMX_EXPLANATION_BLOCK_SIZE:-70}  # explanation block size for explanation-first
+
 # Checkpoint saving controls (env override)
 SAVE_STRATEGY=${SAVE_STRATEGY:-"no"}   # "steps" or "epoch" or "no"
 SAVE_INTERVAL=${SAVE_INTERVAL:-2000}   # steps if SAVE_STRATEGY=steps
@@ -24,6 +28,8 @@ BASE_RUN_NAME="llada_v_qlora_actx_single"
 echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 echo "DATA_PATH: ${DATA_PATH}"
 echo "IMAGE_FOLDER: ${IMAGE_FOLDER}"
+echo "FIMX_EXPLANATION_FIRST: ${FIMX_EXPLANATION_FIRST}"
+echo "FIMX_EXPLANATION_BLOCK_SIZE: ${FIMX_EXPLANATION_BLOCK_SIZE}"
 echo "SAVE_STRATEGY: ${SAVE_STRATEGY}"
 echo "SAVE_INTERVAL: ${SAVE_INTERVAL}"
 echo "LOGGING_NAN_INF_FILTER: ${LOGGING_NAN_INF_FILTER}"
@@ -84,4 +90,6 @@ python llava/train/train_mem.py \
     --enable_complementary_masking False \
     --use_fimx_dataset True \
     --enable_semi_complementary_masking False \
-    --fimx_answer_block_size 20
+    --fimx_answer_block_size 20 \
+    --fimx_explanation_first ${FIMX_EXPLANATION_FIRST} \
+    --fimx_explanation_block_size ${FIMX_EXPLANATION_BLOCK_SIZE}

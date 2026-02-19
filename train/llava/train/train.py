@@ -144,6 +144,8 @@ class DataArguments:
     force_sample: Optional[bool] = field(default=False)
     use_fimx_dataset: bool = field(default=False, metadata={"help": "Use LazySupervisedDatasetForFIMX for FIM-style single-turn data."})
     fimx_answer_block_size: int = field(default=20, metadata={"help": "Answer block size for FIMX dataset (prefix+answer+optional explanation)."})
+    fimx_explanation_first: bool = field(default=False, metadata={"help": "When using FIMX dataset, format assistant labels as: 'Because <explanation>, the answer is <answer>.'"})
+    fimx_explanation_block_size: int = field(default=70, metadata={"help": "Explanation block size for explanation-first FIMX formatting."})
 
 
 @dataclass
@@ -1536,12 +1538,16 @@ class LazySupervisedDatasetForFIMX(Dataset):
         self.tokenizer = tokenizer
         self.data_args = data_args
         self.answer_block_size = answer_block_size
+        self.explanation_first = getattr(data_args, "fimx_explanation_first", False)
+        self.explanation_block_size = getattr(data_args, "fimx_explanation_block_size", 70)
 
         self._reserved_token_id = self.tokenizer.convert_tokens_to_ids(self.RESERVED_SLOT_TOKEN)
         if self._reserved_token_id is None:
             raise ValueError(f"Tokenizer is missing {self.RESERVED_SLOT_TOKEN} token.")
         if self.answer_block_size <= 0:
             raise ValueError("answer_block_size must be a positive integer.")
+        if self.explanation_block_size <= 0:
+            raise ValueError("explanation_block_size must be a positive integer.")
 
         if not data_path.endswith(".json"):
             raise ValueError("LazySupervisedDatasetForFIMX currently supports only JSON files.")
@@ -1652,10 +1658,31 @@ class LazySupervisedDatasetForFIMX(Dataset):
         if isinstance(explanation, list):
             explanation = explanation[0] if explanation else ""
         explanation = explanation.strip()
-        if explanation:
-            explanation = explanation
-            if explanation[-1] not in ".!?":
-                explanation = explanation + "."
+
+        if self.explanation_first:
+            if explanation:
+                # Keep explanation body punctuation-neutral before adding ", the answer is ...".
+                while explanation and explanation[-1] in ".!?":
+                    explanation = explanation[:-1].rstrip()
+
+            explanation_ids = self.tokenizer(explanation, add_special_tokens=False).input_ids if explanation else []
+            explanation_block_ids = [self._reserved_token_id] * self.explanation_block_size
+            exp_copy_len = min(len(explanation_ids), self.explanation_block_size)
+            explanation_block_ids[:exp_copy_len] = explanation_ids[:exp_copy_len]
+
+            because_prefix_ids = self.tokenizer("Because ", add_special_tokens=False).input_ids
+            answer_prefix_ids = self.tokenizer(", the answer is ", add_special_tokens=False).input_ids
+            answer_ids = self.tokenizer(answer, add_special_tokens=False).input_ids if answer else []
+            period_ids = self.tokenizer(".", add_special_tokens=False).input_ids
+
+            label_ids = because_prefix_ids + explanation_block_ids + answer_prefix_ids + answer_ids + period_ids
+            eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+            if eot_id is not None and eot_id >= 0:
+                label_ids.append(eot_id)
+            return label_ids
+
+        if explanation and explanation[-1] not in ".!?":
+            explanation = explanation + "."
 
         explanation_ids: List[int] = []
         if explanation:
@@ -2222,8 +2249,12 @@ def train(attn_implementation=None):
         # Semi-complementary masking specific to FIMX-style data.
         model.config.enable_semi_complementary_masking = training_args.enable_semi_complementary_masking
         if getattr(data_args, "use_fimx_dataset", False):
+            if getattr(data_args, "fimx_explanation_first", False) and training_args.enable_semi_complementary_masking:
+                raise ValueError("`--enable_semi_complementary_masking` is incompatible with `--fimx_explanation_first`.")
             model.config.fimx_answer_block_size = getattr(data_args, "fimx_answer_block_size", 20)
+            model.config.fimx_explanation_block_size = getattr(data_args, "fimx_explanation_block_size", 70)
             model.config.fimx_ans_prefix_len = len(tokenizer("The answer is", add_special_tokens=False).input_ids)
+            model.config.fimx_explanation_first = getattr(data_args, "fimx_explanation_first", False)
         model.config.fimx_because_prefix_len = len(tokenizer(" because", add_special_tokens=False).input_ids)
 
     if training_args.bits in [4, 8]:

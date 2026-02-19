@@ -10,6 +10,8 @@ export NCCL_DEBUG=WARN
 ENABLE_CM=${ENABLE_CM:-false}            # complementary masking (mask + inverse mask)
 USE_FIMX=${USE_FIMX:-false}              # use LazySupervisedDatasetForFIMX
 FIMX_ANSWER_BLOCK_SIZE=${FIMX_ANSWER_BLOCK_SIZE:-20}  # answer block size for FIMX
+FIMX_EXPLANATION_FIRST=${FIMX_EXPLANATION_FIRST:-false}  # format labels as "Because ..., the answer is ..."
+FIMX_EXPLANATION_BLOCK_SIZE=${FIMX_EXPLANATION_BLOCK_SIZE:-70}  # explanation block size for explanation-first
 ENABLE_SEMI_CM=${ENABLE_SEMI_CM:-false}  # semi-complementary masking for FIMX
 
 # Optional checkpoint saving controls (env override)
@@ -32,6 +34,8 @@ echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 echo "ENABLE_CM: ${ENABLE_CM}"
 echo "USE_FIMX: ${USE_FIMX}"
 echo "FIMX_ANSWER_BLOCK_SIZE: ${FIMX_ANSWER_BLOCK_SIZE}"
+echo "FIMX_EXPLANATION_FIRST: ${FIMX_EXPLANATION_FIRST}"
+echo "FIMX_EXPLANATION_BLOCK_SIZE: ${FIMX_EXPLANATION_BLOCK_SIZE}"
 echo "ENABLE_SEMI_CM: ${ENABLE_SEMI_CM}"
 echo "SAVE_STRATEGY: ${SAVE_STRATEGY}"
 echo "SAVE_INTERVAL: ${SAVE_INTERVAL}"
@@ -90,4 +94,6 @@ python llava/train/train_mem.py \
     --enable_complementary_masking ${ENABLE_CM} \
     --use_fimx_dataset ${USE_FIMX} \
     --fimx_answer_block_size ${FIMX_ANSWER_BLOCK_SIZE} \
+    --fimx_explanation_first ${FIMX_EXPLANATION_FIRST} \
+    --fimx_explanation_block_size ${FIMX_EXPLANATION_BLOCK_SIZE} \
     --enable_semi_complementary_masking ${ENABLE_SEMI_CM}

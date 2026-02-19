@@ -26,23 +26,30 @@ use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cac
 
 warnings.filterwarnings("ignore")
 # pretrained = "GSAI-ML/LLaDA-V"
-pretrained = "./exp/llada_v_lora_actx"
+pretrained = "./exp/llada_v_qlora_actx_single"
 model_base = "/workspace/model/LLaDA-V-HF"
 
 model_name = "llava_llada_lora"
 device = "cuda:0"
 device_map = "cuda:0"
 
-tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, model_base, model_name, attn_implementation="sdpa", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
+tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, model_base, model_name, attn_implementation="sdpa", device_map=device_map, load_4bit=True)  # Add any other thing you want to pass in llava_model_args
 
 model.eval()
-image = Image.open("/workspace/ACT-X/images/026558760.jpg")
+# image = Image.open("/workspace/ACT-X/images/026558760.jpg")
+image = Image.open("tennis.jpg")
 image_tensor = process_images([image], image_processor, model.config)
 image_tensor = [_image.to(dtype=torch.float16, device=device) for _image in image_tensor]
 
 conv_template = "llava_llada"
-question = DEFAULT_IMAGE_TOKEN + "\nWhat activity is the person (or people) performing in this image? Before you answer, please explain the reason first using the format below: 'Because..., the answer is...'"
+question = DEFAULT_IMAGE_TOKEN + "\nWhat activity is the person (or people) performing in this image? Before you answer, please explain the reason first using the format below: 'Because..., the answer is...'. You can use <|reserved_token_1|> to trigger an early stop for a brief explanation."
 # question = DEFAULT_IMAGE_TOKEN + "\nWhat she Doing? Explain why."
+
+explanation_max_token = 70 
+answer_max_token = 12
+FIM = '<|reserved_token_1|>'
+# FIM = ''
+draft_answer = f'''Because{"<|mdm_mask|>"*explanation_max_token}, the answer is{"<|mdm_mask|>"*answer_max_token}<|eot_id|>'''
 
 conv = copy.deepcopy(conv_templates[conv_template])
 conv.append_message(conv.roles[0], question)
@@ -71,9 +78,12 @@ else:
 input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
 image_sizes = [image.size]
 
+
+draft_tokens = tokenizer(draft_answer,return_tensors='pt').to(input_ids.device).input_ids
+
 start_time = time.time()
 # LLaDA generate_with_embeds expects stop strings (it tokenizes them internally).
-stop_tokens = None # ["<|eot_id|>"]
+stop_tokens = ["<|eot_id|>"]
 
 cont = model.generate(
     input_ids,
@@ -86,6 +96,7 @@ cont = model.generate(
     stopping_criteria=stop_tokens,
     prefix_refresh_interval=32,
     threshold=1,
+    draft_tokens=draft_tokens,
 )
 end_time = time.time()
 generation_time = end_time - start_time
