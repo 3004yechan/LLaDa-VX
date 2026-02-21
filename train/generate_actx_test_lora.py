@@ -1,9 +1,3 @@
-# python generate_actx_test_lora.py \
-#     --batch-size 2 \
-#     --use-draft-tokens \
-#     --enable-reserved-collapse \
-#     --output-json /home/20223206/ACT-X/LLaDA-VX_actX_p_full_unfiltered_bs2.json
-
 import argparse
 import copy
 import json
@@ -126,20 +120,14 @@ def parse_args():
         action="store_true",
         help="Enable dLLM-cache hook for speed-up.",
     )
-    parser.add_argument("--prompt-interval-steps", type=int, default=25)
-    parser.add_argument("--gen-interval-steps", type=int, default=7)
-    parser.add_argument("--transfer-ratio", type=float, default=0.25)
+    parser.add_argument("--prompt-interval-steps", type=int, default=8)
+    parser.add_argument("--gen-interval-steps", type=int, default=2)
+    parser.add_argument("--transfer-ratio", type=float, default=0.8)
     parser.add_argument(
         "--save-every",
         type=int,
         default=100,
         help="Save intermediate results every N samples.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=1,
-        help="Number of samples per generate() call. Default keeps original behavior.",
     )
     return parser.parse_args()
 
@@ -157,13 +145,6 @@ def main():
     args = parse_args()
     if args.use_fast_dllm and args.use_dllm_cache:
         raise ValueError("Choose only one of --use-fast-dllm or --use-dllm-cache.")
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be >= 1")
-    if args.batch_size > 1 and (args.use_fast_dllm or args.use_dllm_cache):
-        raise ValueError(
-            "--batch-size > 1 currently supports only the base generate path. "
-            "Disable --use-fast-dllm and --use-dllm-cache for batched inference."
-        )
 
     test_json = Path(args.test_json)
     image_dir = Path(args.image_dir)
@@ -224,81 +205,67 @@ def main():
     results = []
     start_time = time.time()
 
-    processed = 0
-    for start in range(0, total, args.batch_size):
-        batch_entries = entries[start : start + args.batch_size]
-        valid_items = []
-        batch_results = [None] * len(batch_entries)
+    for idx, (image_id, meta) in enumerate(entries, start=1):
+        image_name = meta.get("image_name", f"{image_id}.jpg")
+        image_path = image_dir / image_name
+        if not image_path.exists():
+            print(f"[WARN] Missing image: {image_path}")
+            results.append({"image_id": int(image_id), "caption": "", "cont": []})
+            elapsed = time.time() - start_time
+            avg = elapsed / idx
+            eta = avg * (total - idx)
+            progress = (idx / total) * 100
+            print(
+                f"[{idx}/{total}] {progress:.2f}% | elapsed {format_seconds(elapsed)} | eta {format_seconds(eta)}"
+            )
+            continue
 
-        for local_idx, (image_id, meta) in enumerate(batch_entries):
-            image_name = meta.get("image_name", f"{image_id}.jpg")
-            image_path = image_dir / image_name
-            if not image_path.exists():
-                print(f"[WARN] Missing image: {image_path}")
-                batch_results[local_idx] = {"image_id": int(image_id), "caption": "", "cont": []}
-                continue
+        image = Image.open(image_path).convert("RGB")
+        image_tensor = process_images([image], image_processor, model.config)
+        image_tensor = [_image.to(dtype=torch.float16, device=args.device) for _image in image_tensor]
+        image_sizes = [image.size]
 
-            image = Image.open(image_path).convert("RGB")
-            valid_items.append((local_idx, image_id, image))
+        with torch.no_grad():
+            generate_kwargs = {}
+            if draft_tokens is not None:
+                generate_kwargs["draft_tokens"] = draft_tokens
+            if args.enable_reserved_collapse:
+                generate_kwargs["enable_reserved_collapse"] = True
+                generate_kwargs["reserved_token_id"] = args.reserved_token_id
+                generate_kwargs["mdm_mask_id"] = args.mdm_mask_id
+            cont = model.generate(
+                input_ids,
+                images=image_tensor,
+                image_sizes=image_sizes,
+                steps=args.steps,
+                gen_length=args.gen_length,
+                block_length=args.block_length,
+                tokenizer=tokenizer,
+                stopping_criteria=["<|eot_id|>"],
+                prefix_refresh_interval=args.prefix_refresh_interval,
+                threshold=args.threshold,
+                **generate_kwargs,
+            )
 
-        if valid_items:
-            images = [item[2] for item in valid_items]
-            image_tensor = process_images(images, image_processor, model.config)
-            image_tensor = [_image.to(dtype=torch.float16, device=args.device) for _image in image_tensor]
-            image_sizes = [image.size for image in images]
-
-            batch_n = len(valid_items)
-            batch_input_ids = input_ids.repeat(batch_n, 1)
-
-            with torch.no_grad():
-                generate_kwargs = {}
-                if draft_tokens is not None:
-                    generate_kwargs["draft_tokens"] = draft_tokens.repeat(batch_n, 1)
-                if args.enable_reserved_collapse:
-                    generate_kwargs["enable_reserved_collapse"] = True
-                    generate_kwargs["reserved_token_id"] = args.reserved_token_id
-                    generate_kwargs["mdm_mask_id"] = args.mdm_mask_id
-                cont = model.generate(
-                    batch_input_ids,
-                    images=image_tensor,
-                    image_sizes=image_sizes,
-                    modalities=["image"] * batch_n,
-                    steps=args.steps,
-                    gen_length=args.gen_length,
-                    block_length=args.block_length,
-                    tokenizer=tokenizer,
-                    stopping_criteria=["<|eot_id|>"],
-                    prefix_refresh_interval=args.prefix_refresh_interval,
-                    threshold=args.threshold,
-                    **generate_kwargs,
-                )
-
-            for row_idx, (local_idx, image_id, _) in enumerate(valid_items):
-                cont_raw = cont[row_idx].tolist()
-                cont_filtered = [token_id for token_id in cont_raw if token_id != args.reserved_token_id]
-                caption = tokenizer.decode(cont_filtered, skip_special_tokens=False)
-                caption = caption.replace("<|eot_id|>", "").strip()
-                batch_results[local_idx] = {"image_id": int(image_id), "caption": caption, "cont": cont_filtered}
-
-        for item in batch_results:
-            if item is None:
-                continue
-            results.append(item)
-            processed += 1
+        cont_raw = cont[0].tolist()
+        cont_filtered = [token_id for token_id in cont_raw if token_id != args.reserved_token_id]
+        caption = tokenizer.decode(cont_filtered, skip_special_tokens=False)
+        caption = caption.replace("<|eot_id|>", "").strip()
+        results.append({"image_id": int(image_id), "caption": caption, "cont": cont_filtered})
 
         elapsed = time.time() - start_time
-        avg = elapsed / processed if processed > 0 else 0
-        eta = avg * (total - processed)
-        progress = (processed / total) * 100 if total > 0 else 100
+        avg = elapsed / idx
+        eta = avg * (total - idx)
+        progress = (idx / total) * 100
         print(
-            f"[{processed}/{total}] {progress:.2f}% | elapsed {format_seconds(elapsed)} | eta {format_seconds(eta)}"
+            f"[{idx}/{total}] {progress:.2f}% | elapsed {format_seconds(elapsed)} | eta {format_seconds(eta)}"
         )
 
-        if processed % args.save_every == 0:
+        if idx % args.save_every == 0:
             output_json.parent.mkdir(parents=True, exist_ok=True)
             with open(output_json, "w", encoding="utf-8") as f:
                 json.dump(results, f, ensure_ascii=False, indent=2)
-            print(f"[{processed}/{total}] saved to {output_json}")
+            print(f"[{idx}/{total}] saved to {output_json}")
 
     output_json.parent.mkdir(parents=True, exist_ok=True)
     with open(output_json, "w", encoding="utf-8") as f:

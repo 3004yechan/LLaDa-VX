@@ -143,8 +143,6 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
-        if inputs_embeds.shape[0] > 1:
-            return super().generate_with_batch_embeds(inputs_embeds=inputs_embeds, **kwargs)
         return super().generate_with_embeds(inputs_embeds=inputs_embeds, **kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):

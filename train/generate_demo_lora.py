@@ -18,11 +18,11 @@ import time
 import sys
 import warnings
 
-prompt_interval_steps = 25
-gen_interval_steps = 7
-transfer_ratio = 0.25
+prompt_interval_steps = 8
+gen_interval_steps = 2
+transfer_ratio = 0.8
 use_fast_dllm = False  # using fast-dLLM (https://github.com/NVlabs/Fast-dLLM) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 6s to generate 128 tokens.
-use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cache) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 25s to generate 128 tokens.
+use_dllm_cache = True  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cache) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 25s to generate 128 tokens.
 
 warnings.filterwarnings("ignore")
 # pretrained = "GSAI-ML/LLaDA-V"
@@ -38,7 +38,7 @@ tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained
 model.eval()
 hook_model = model.get_base_model() if hasattr(model, "get_base_model") else model
 # image = Image.open("/workspace/ACT-X/images/026558760.jpg")
-image = Image.open("tennis.jpg")
+image = Image.open("/home/20223206/ACT-X/images/071674638.jpg")
 image_tensor = process_images([image], image_processor, model.config)
 image_tensor = [_image.to(dtype=torch.float16, device=device) for _image in image_tensor]
 
