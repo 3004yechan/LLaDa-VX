@@ -26,8 +26,8 @@ use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cac
 
 warnings.filterwarnings("ignore")
 # pretrained = "GSAI-ML/LLaDA-V"
-pretrained = "./exp/llada_v_qlora_actx_single"
-model_base = "/workspace/model/LLaDA-V-HF"
+pretrained = "/home/20223206/exp/llada_v_qlora_actx_single"
+model_base = "/home/20223206/model/LLaDA-V-HF"
 
 model_name = "llava_llada_lora"
 device = "cuda:0"
@@ -36,6 +36,7 @@ device_map = "cuda:0"
 tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, model_base, model_name, attn_implementation="sdpa", device_map=device_map, load_4bit=True)  # Add any other thing you want to pass in llava_model_args
 
 model.eval()
+hook_model = model.get_base_model() if hasattr(model, "get_base_model") else model
 # image = Image.open("/workspace/ACT-X/images/026558760.jpg")
 image = Image.open("tennis.jpg")
 image_tensor = process_images([image], image_processor, model.config)
@@ -46,8 +47,11 @@ question = DEFAULT_IMAGE_TOKEN + "\nWhat activity is the person (or people) perf
 # question = DEFAULT_IMAGE_TOKEN + "\nWhat she Doing? Explain why."
 
 explanation_max_token = 70 
-answer_max_token = 12
-FIM = '<|reserved_token_1|>'
+answer_max_token = 30
+PAD = '<|reserved_token_1|>'
+enable_reserved_collapse = True
+reserved_token_id = 126085
+mdm_mask_id = 126336
 # FIM = ''
 draft_answer = f'''Because{"<|mdm_mask|>"*explanation_max_token}, the answer is{"<|mdm_mask|>"*answer_max_token}<|eot_id|>'''
 
@@ -58,7 +62,7 @@ prompt_question = conv.get_prompt()
 
 model.eval()
 if use_fast_dllm:
-    register_fast_dllm_hook(model)
+    register_fast_dllm_hook(hook_model)
     print("Testing with Fast dLLM hook enabled")
 elif use_dllm_cache:
     dLLMCache.new_instance(
@@ -70,7 +74,7 @@ elif use_dllm_cache:
             )
         )
     )
-    register_cache_LLaDA_V(model, "model.layers")
+    register_cache_LLaDA_V(hook_model, "model.layers")
     print("Testing with cache enabled")
 else:
     print("Testing without cache")
@@ -89,14 +93,17 @@ cont = model.generate(
     input_ids,
     images=image_tensor,
     image_sizes=image_sizes,
-    steps=128,
+    steps=64,
     gen_length=128,
     block_length=128,
     tokenizer=tokenizer,
     stopping_criteria=stop_tokens,
     prefix_refresh_interval=32,
-    threshold=1,
+    threshold=1, # for fast-dllm. default=1. None일경우 정해진 step을 모두 채움.
     draft_tokens=draft_tokens,
+    enable_reserved_collapse=enable_reserved_collapse,
+    reserved_token_id=reserved_token_id,
+    mdm_mask_id=mdm_mask_id,
 )
 end_time = time.time()
 generation_time = end_time - start_time
@@ -105,3 +112,14 @@ print(f"Generation time: {generation_time:.4f} seconds")
 print(cont)
 text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=False)
 print(text_outputs)
+
+RESERVED_TOKEN_1_ID = 126085
+cont_without_reserved = [
+    [token_id for token_id in seq.tolist() if token_id != RESERVED_TOKEN_1_ID]
+    for seq in cont
+]
+text_outputs_without_reserved = [
+    tokenizer.decode(seq, skip_special_tokens=False)
+    for seq in cont_without_reserved
+]
+print("result:", text_outputs_without_reserved)

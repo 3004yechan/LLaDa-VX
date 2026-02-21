@@ -132,7 +132,7 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
-        modalities = kwargs.pop("modalities", None) if "modalities" in kwargs and modalities is None else modalities
+        modalities = kwargs.pop("modalities", modalities)
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
         if "inputs_embeds" in kwargs:
@@ -143,6 +143,8 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
+        if inputs_embeds.shape[0] > 1:
+            return super().generate_with_batch_embeds(inputs_embeds=inputs_embeds, **kwargs)
         return super().generate_with_embeds(inputs_embeds=inputs_embeds, **kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):

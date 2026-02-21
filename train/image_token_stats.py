@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-path", type=str, required=True, help="Dataset JSON path")
     p.add_argument("--image-root", type=str, required=True, help="Root folder for image files")
     p.add_argument("--image-grid-pinpoints", type=str, default="(1x1),...,(6x6)")
-    p.add_argument("--image-aspect-ratio", type=str, default="anyres_max_2")
+    p.add_argument("--image-aspect-ratio", type=str, default="anyres_max_4")
     p.add_argument("--mm-patch-merge-type", type=str, default="spatial_unpad")
     p.add_argument("--vision-image-size", type=int, default=384, help="Vision tower input size")
     p.add_argument("--vision-patch-size", type=int, default=14, help="Vision patch size")

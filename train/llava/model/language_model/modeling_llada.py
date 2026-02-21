@@ -1328,6 +1328,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         # Use mixed precision for faster computation
         with torch.cuda.amp.autocast(enabled=True):
             # Handle generation suffix
+            enable_reserved_collapse = kwargs.pop("enable_reserved_collapse", False)
+            reserved_token_id = kwargs.pop("reserved_token_id", 126085)
+            mdm_mask_id = kwargs.pop("mdm_mask_id", mask_id)
             suffix_embeds = None
             suffix_token_ids = None
             suffix_len = 0
@@ -1346,6 +1349,13 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             masked_embed = self.model.embed_tokens(torch.tensor([mask_id]).to(inputs_embeds.device)) # shape (1, d)
             x_embeds = masked_embed.repeat(1, total_length, 1).to(inputs_embeds.device) # shape (1, l + gen_length + suffix_len, d)
             x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds.clone()
+            gen_start = inputs_embeds.shape[1]
+            gen_end = gen_start + gen_length
+            reserved_embed = None
+            if enable_reserved_collapse:
+                reserved_embed = self.model.embed_tokens(
+                    torch.tensor([reserved_token_id], device=inputs_embeds.device)
+                ).to(x_embeds.dtype)
 
             # Create a tracking tensor for token IDs for final output
             x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
@@ -1359,10 +1369,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 assert draft_tokens.shape[0] == x.shape[0], "draft_tokens batch size mismatch"
                 assert draft_tokens.shape[1] <= gen_length, "draft_tokens length must be <= gen_length"
                 draft_embeds = self.model.embed_tokens(draft_tokens).to(x_embeds.dtype)
-                gen_start = inputs_embeds.shape[1]
-                gen_end = gen_start + draft_tokens.shape[1]
-                x[:, gen_start:gen_end] = draft_tokens
-                x_embeds[:, gen_start:gen_end] = draft_embeds
+                draft_end = gen_start + draft_tokens.shape[1]
+                x[:, gen_start:draft_end] = draft_tokens
+                x_embeds[:, gen_start:draft_end] = draft_embeds
             # === End draft token seeding ===
 
             if suffix_embeds is not None:
@@ -1492,6 +1501,25 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     x_embeds[transfer_index] = x0_embeds[transfer_index]
                     x[transfer_index] = x0[transfer_index]
 
+                    if enable_reserved_collapse:
+                        changed_positions = []
+                        for pos in range(gen_start, gen_end):
+                            if int(x[0, pos].item()) != reserved_token_id:
+                                continue
+                            nxt = pos + 1
+                            while nxt < gen_end:
+                                nxt_id = int(x[0, nxt].item())
+                                if nxt_id == mdm_mask_id or nxt_id == reserved_token_id:
+                                    if nxt_id != reserved_token_id:
+                                        changed_positions.append(nxt)
+                                    x[0, nxt] = reserved_token_id
+                                    nxt += 1
+                                    continue
+                                break
+                        if changed_positions:
+                            idx = torch.tensor(changed_positions, device=x.device, dtype=torch.long)
+                            x_embeds[:, idx, :] = reserved_embed
+
                     # New: Check for stop words after each update
                     if stopping_criteria is not None:
                         # Only check the generated part (excluding the suffix)
@@ -1531,6 +1559,204 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     ], dim=1)
                 else:
                     return x[:, inputs_embeds.shape[1]:inputs_embeds.shape[1]+gen_length]
+
+    @torch.no_grad()
+    def generate_with_batch_embeds(self, inputs_embeds, steps=128, gen_length=128, block_length=128, temperature=0.,
+        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, stopping_criteria=None,
+        generation_suffix=None, draft_tokens=None, **kwargs):
+        with torch.cuda.amp.autocast(enabled=True):
+            enable_reserved_collapse = kwargs.pop("enable_reserved_collapse", False)
+            reserved_token_id = kwargs.pop("reserved_token_id", 126085)
+            mdm_mask_id = kwargs.pop("mdm_mask_id", mask_id)
+
+            batch_size = inputs_embeds.shape[0]
+            prompt_len = inputs_embeds.shape[1]
+
+            suffix_embeds = None
+            suffix_token_ids = None
+            suffix_len = 0
+            if generation_suffix is not None and tokenizer is not None and len(generation_suffix) > 0:
+                suffix_token_ids_1d = tokenizer.encode(generation_suffix, add_special_tokens=False)
+                suffix_token_ids = torch.tensor(
+                    suffix_token_ids_1d, dtype=torch.long, device=inputs_embeds.device
+                ).unsqueeze(0).repeat(batch_size, 1)
+                suffix_embeds = self.model.embed_tokens(suffix_token_ids)
+                suffix_len = suffix_embeds.shape[1]
+
+            total_length = prompt_len + gen_length + suffix_len
+            masked_embed = self.model.embed_tokens(torch.tensor([mask_id]).to(inputs_embeds.device))
+            x_embeds = masked_embed.repeat(batch_size, total_length, 1).to(inputs_embeds.device)
+            x_embeds[:, :prompt_len] = inputs_embeds.clone()
+
+            gen_start = prompt_len
+            gen_end = gen_start + gen_length
+
+            x = torch.full((batch_size, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
+            if suffix_token_ids is not None:
+                x[:, -suffix_len:] = suffix_token_ids
+
+            if draft_tokens is not None:
+                draft_tokens = draft_tokens.to(x.device)
+                assert draft_tokens.dim() == 2, "draft_tokens should be 2D (batch, length)"
+                if draft_tokens.shape[0] == 1 and batch_size > 1:
+                    draft_tokens = draft_tokens.repeat(batch_size, 1)
+                assert draft_tokens.shape[0] == batch_size, "draft_tokens batch size mismatch"
+                assert draft_tokens.shape[1] <= gen_length, "draft_tokens length must be <= gen_length"
+                draft_embeds = self.model.embed_tokens(draft_tokens).to(x_embeds.dtype)
+                draft_end = gen_start + draft_tokens.shape[1]
+                x[:, gen_start:draft_end] = draft_tokens
+                x_embeds[:, gen_start:draft_end] = draft_embeds
+
+            if suffix_embeds is not None:
+                x_embeds[:, -suffix_len:] = suffix_embeds
+
+            prompt_index = torch.zeros((batch_size, total_length), dtype=torch.bool, device=inputs_embeds.device)
+            prompt_index[:, :prompt_len] = 1
+
+            assert gen_length % block_length == 0
+            num_blocks = gen_length // block_length
+            assert steps % num_blocks == 0
+            steps = steps // num_blocks
+
+            found_stop_seq = torch.zeros(batch_size, dtype=torch.bool, device=inputs_embeds.device)
+            stop_position = torch.full(
+                (batch_size,), prompt_len + gen_length, dtype=torch.long, device=inputs_embeds.device
+            )
+
+            stop_tokens = []
+            if stopping_criteria is not None:
+                assert tokenizer is not None, "tokenizer is required when stopping_criteria is not None"
+                for stop_str in stopping_criteria:
+                    tokens = tokenizer.encode(stop_str, add_special_tokens=False)
+                    stop_tokens.append(tokens)
+
+            reserved_embed = None
+            if enable_reserved_collapse:
+                reserved_embed = self.model.embed_tokens(
+                    torch.tensor([reserved_token_id], device=inputs_embeds.device)
+                ).to(x_embeds.dtype)
+
+            feature_cache = dLLMCache()
+            feature_cache.reset_cache(prompt_len)
+
+            for num_block in range(num_blocks):
+                block_start = prompt_len + num_block * block_length
+                block_end = prompt_len + (num_block + 1) * block_length
+
+                if torch.all(found_stop_seq & (stop_position <= block_start)):
+                    break
+
+                block_embeds = x_embeds[:, block_start:block_end]
+                block_mask_index = torch.all(torch.abs(block_embeds - masked_embed) < 1e-5, dim=2)
+                num_transfer_tokens = self.get_num_transfer_tokens(block_mask_index, steps)
+
+                for i in range(steps):
+                    mask_index = torch.all(torch.abs(x_embeds - masked_embed) < 1e-5, dim=2)
+                    current_block_masks = mask_index[:, block_start:block_end]
+                    if not current_block_masks.any():
+                        break
+
+                    if cfg_scale > 0.:
+                        un_embeds = x_embeds.clone()
+                        un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)
+                        un_embeds[un_mask] = masked_embed.repeat(x_embeds.shape[0], x_embeds.shape[1], 1)[un_mask]
+                        combined_embeds = torch.cat([x_embeds, un_embeds], dim=0)
+                        outputs = self.model(inputs_embeds=combined_embeds)
+                        logits = self.lm_head(outputs[0])
+                        logits, un_logits = torch.chunk(logits, 2, dim=0)
+                        logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+                    else:
+                        outputs = self.model(inputs_embeds=x_embeds)
+                        logits = self.lm_head(outputs[0])
+
+                    for token_id in [126081, 126080, 126346, 126347]:
+                        logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
+
+                    logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature)
+                    x0 = torch.argmax(logits_with_noise, dim=-1)
+
+                    if remasking == 'low_confidence':
+                        p = F.softmax(logits, dim=-1)
+                        x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+                    elif remasking == 'random':
+                        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+                    else:
+                        raise NotImplementedError(remasking)
+
+                    x0_p[:, block_end:] = -np.inf
+                    if suffix_len > 0:
+                        x0_p[:, -suffix_len:] = -np.inf
+                    for b in range(batch_size):
+                        if found_stop_seq[b]:
+                            x0_p[b, int(stop_position[b].item()):] = -np.inf
+
+                    x0_embeds = self.model.embed_tokens(x0)
+                    x0_embeds = torch.where(mask_index.unsqueeze(-1).expand_as(x_embeds), x0_embeds, x_embeds)
+                    x0 = torch.where(mask_index, x0, x)
+
+                    confidence = torch.where(mask_index, x0_p, -np.inf)
+                    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                    for j in range(confidence.shape[0]):
+                        k = int(num_transfer_tokens[j, i].item())
+                        if k <= 0:
+                            continue
+                        _, select_index = torch.topk(confidence[j], k=k)
+                        transfer_index[j, select_index] = True
+
+                    x_embeds[transfer_index] = x0_embeds[transfer_index]
+                    x[transfer_index] = x0[transfer_index]
+
+                    if enable_reserved_collapse:
+                        changed_positions = []
+                        for b in range(batch_size):
+                            for pos in range(gen_start, gen_end):
+                                if int(x[b, pos].item()) != reserved_token_id:
+                                    continue
+                                nxt = pos + 1
+                                while nxt < gen_end:
+                                    nxt_id = int(x[b, nxt].item())
+                                    if nxt_id == mdm_mask_id or nxt_id == reserved_token_id:
+                                        if nxt_id != reserved_token_id:
+                                            changed_positions.append((b, nxt))
+                                        x[b, nxt] = reserved_token_id
+                                        nxt += 1
+                                        continue
+                                    break
+                        if changed_positions:
+                            b_idx = torch.tensor([p[0] for p in changed_positions], device=x.device, dtype=torch.long)
+                            t_idx = torch.tensor([p[1] for p in changed_positions], device=x.device, dtype=torch.long)
+                            x_embeds[b_idx, t_idx, :] = reserved_embed[0]
+
+                    if stopping_criteria is not None:
+                        generated_part = x[:, prompt_len:prompt_len + gen_length]
+                        for b in range(batch_size):
+                            for stop_seq in stop_tokens:
+                                if not isinstance(stop_seq, list):
+                                    stop_seq = [stop_seq]
+                                if len(stop_seq) == 0:
+                                    continue
+                                for start_idx in range(generated_part.size(1) - len(stop_seq) + 1):
+                                    if torch.all(
+                                        generated_part[b, start_idx:start_idx + len(stop_seq)]
+                                        == torch.tensor(stop_seq, device=x.device)
+                                    ):
+                                        current_position = prompt_len + start_idx
+                                        if (not found_stop_seq[b]) or (current_position < stop_position[b]):
+                                            stop_position[b] = current_position
+                                            found_stop_seq[b] = True
+                                        break
+
+            result = x[:, prompt_len:prompt_len + gen_length].clone()
+            if stop_tokens and len(stop_tokens[0]) > 0:
+                pad_id = stop_tokens[0][0]
+                for b in range(batch_size):
+                    if found_stop_seq[b]:
+                        cut = int(stop_position[b].item()) - prompt_len
+                        if cut < result.shape[1]:
+                            result[b, cut:] = pad_id
+            if suffix_len > 0:
+                return torch.cat([result, x[:, -suffix_len:]], dim=1)
+            return result
 
 
     @add_start_docstrings_to_model_forward(LLaDA_INPUTS_DOCSTRING)

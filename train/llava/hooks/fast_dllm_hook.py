@@ -196,6 +196,9 @@ class FastDLLMGenerationHook:
         """
         # Use mixed precision for faster computation
         with torch.cuda.amp.autocast(enabled=True):
+            enable_reserved_collapse = kwargs.pop("enable_reserved_collapse", False)
+            reserved_token_id = kwargs.pop("reserved_token_id", 126085)
+            mdm_mask_id = kwargs.pop("mdm_mask_id", mask_id)
             # Handle generation suffix
             suffix_embeds = None
             suffix_token_ids = None
@@ -218,6 +221,13 @@ class FastDLLMGenerationHook:
             x = torch.full((1, total_length), mask_id, dtype=torch.long, device=inputs_embeds.device)
             if suffix_token_ids is not None:
                 x[:, -suffix_len:] = suffix_token_ids
+            gen_start = inputs_embeds.shape[1]
+            gen_end = gen_start + gen_length
+            reserved_embed = None
+            if enable_reserved_collapse:
+                reserved_embed = self.model.model.embed_tokens(
+                    torch.tensor([reserved_token_id], device=inputs_embeds.device)
+                ).to(x_embeds.dtype)
 
             # --- FIM draft support start ---
             if draft_tokens is not None:
@@ -238,6 +248,27 @@ class FastDLLMGenerationHook:
             # Prompt index tracking
             prompt_index = torch.zeros((1, total_length), dtype=torch.bool, device=inputs_embeds.device)
             prompt_index[:, :inputs_embeds.shape[1]] = 1
+
+            def apply_reserved_collapse_inplace():
+                if not enable_reserved_collapse:
+                    return
+                changed_positions = []
+                for pos in range(gen_start, gen_end):
+                    if int(x[0, pos].item()) != reserved_token_id:
+                        continue
+                    nxt = pos + 1
+                    while nxt < gen_end:
+                        nxt_id = int(x[0, nxt].item())
+                        if nxt_id == mdm_mask_id or nxt_id == reserved_token_id:
+                            if nxt_id != reserved_token_id:
+                                changed_positions.append(nxt)
+                            x[0, nxt] = reserved_token_id
+                            nxt += 1
+                            continue
+                        break
+                if changed_positions:
+                    idx = torch.tensor(changed_positions, device=x.device, dtype=torch.long)
+                    x_embeds[:, idx, :] = reserved_embed
 
             assert gen_length % block_length == 0
             num_blocks = gen_length // block_length
@@ -339,6 +370,7 @@ class FastDLLMGenerationHook:
                         x0_embeds = torch.where(mask_index.unsqueeze(-1).expand_as(x_embeds), x0_embeds, x_embeds)
                         x_embeds[transfer_index] = x0_embeds[transfer_index]
                         x[transfer_index] = x0[transfer_index]
+                        apply_reserved_collapse_inplace()
                     else:
                         x0, transfer_index = self._get_transfer_index(
                             logits, temperature, remasking, mask_index[:, block_start:], x[:, block_start:],
@@ -350,6 +382,7 @@ class FastDLLMGenerationHook:
                                               x0_embeds, x_embeds[:, block_start:])
                         x_embeds[:, block_start:][transfer_index] = x0_embeds[transfer_index]
                         x[:, block_start:][transfer_index] = x0[transfer_index]
+                        apply_reserved_collapse_inplace()
 
                     # Check for stop words
                     if stopping_criteria is not None:
