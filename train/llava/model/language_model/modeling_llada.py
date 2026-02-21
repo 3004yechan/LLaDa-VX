@@ -378,8 +378,12 @@ class LLaDAAttention(nn.Module):
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # Default keeps fp32 softmax for stability; optionally lower precision for memory savings.
+        use_low_precision_softmax = bool(getattr(self.config, "use_low_precision_attn_softmax", False))
+        softmax_dtype = query_states.dtype if use_low_precision_softmax else torch.float32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=softmax_dtype)
+        if attn_weights.dtype != query_states.dtype:
+            attn_weights = attn_weights.to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -1327,6 +1331,16 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         '''
         # Use mixed precision for faster computation
         with torch.cuda.amp.autocast(enabled=True):
+            enable_attention_remask = kwargs.pop("enable_attention_remask", False)
+            attention_remask_top_tokens = kwargs.pop("attention_remask_top_tokens", 0)
+            attention_remask_top_heads = kwargs.pop("attention_remask_top_heads", 0)
+            attention_remask_low_precision_softmax = kwargs.pop("attention_remask_low_precision_softmax", False)
+            if enable_attention_remask and cfg_scale > 0.0:
+                raise ValueError("enable_attention_remask is not supported with cfg_scale > 0.")
+            self.config.use_low_precision_attn_softmax = bool(
+                enable_attention_remask and attention_remask_low_precision_softmax
+            )
+
             # Handle generation suffix
             enable_reserved_collapse = kwargs.pop("enable_reserved_collapse", False)
             reserved_token_id = kwargs.pop("reserved_token_id", 126085)
@@ -1400,6 +1414,32 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     tokens = tokenizer.encode(stop_str, add_special_tokens=False)
                     stop_tokens.append(tokens)
 
+            def _extract_attention_scores(model_outputs):
+                if not enable_attention_remask:
+                    return None
+                attentions = None
+                if hasattr(model_outputs, "attentions"):
+                    attentions = model_outputs.attentions
+                if attentions is None or len(attentions) == 0:
+                    return None
+                # last layer attention: [batch, heads, query_len, key_len]
+                last_attn = attentions[-1]
+                prefix_len = inputs_embeds.shape[1]
+                prefix_attn = last_attn[:, :, :, :prefix_len]
+                if prefix_attn.shape[-1] == 0:
+                    return torch.zeros(prefix_attn.shape[0], prefix_attn.shape[2], device=prefix_attn.device)
+
+                token_k = int(attention_remask_top_tokens)
+                if token_k > 0 and token_k < prefix_attn.shape[-1]:
+                    token_scores = torch.topk(prefix_attn, k=token_k, dim=-1).values.mean(dim=-1)
+                else:
+                    token_scores = prefix_attn.mean(dim=-1)
+
+                head_k = int(attention_remask_top_heads)
+                if head_k > 0 and head_k < token_scores.shape[1]:
+                    return torch.topk(token_scores, k=head_k, dim=1).values.mean(dim=1)
+                return token_scores.mean(dim=1)
+
             feature_cache = dLLMCache()
             feature_cache.reset_cache(inputs_embeds.shape[1])
             for num_block in range(num_blocks):
@@ -1441,18 +1481,20 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         combined_embeds = torch.cat([x_embeds, un_embeds], dim=0)
                         
                         # Forward pass
-                        outputs = self.model(inputs_embeds=combined_embeds)
+                        outputs = self.model(inputs_embeds=combined_embeds, output_attentions=enable_attention_remask)
                         # logits = self.lm_head(outputs[0]).float()
                         logits = self.lm_head(outputs[0])
+                        attn_scores = None
                         
                         # Split and apply CFG
                         logits, un_logits = torch.chunk(logits, 2, dim=0)
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
                         # Forward pass
-                        outputs = self.model(inputs_embeds=x_embeds)
+                        outputs = self.model(inputs_embeds=x_embeds, output_attentions=enable_attention_remask)
                         # logits = self.lm_head(outputs[0]).float()
                         logits = self.lm_head(outputs[0])
+                        attn_scores = _extract_attention_scores(outputs)
                     
                     for token_id in [126081, 126080, 126346, 126347]:
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
@@ -1472,6 +1514,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                     else:
                         raise NotImplementedError(remasking)
+                    if enable_attention_remask and attn_scores is not None:
+                        x0_p = attn_scores.to(x0_p.dtype)
                     
                     # If a stop word is found, only process positions before the stop word
                     if found_stop_seq:

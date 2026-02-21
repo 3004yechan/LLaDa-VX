@@ -120,6 +120,28 @@ def parse_args():
         action="store_true",
         help="Enable dLLM-cache hook for speed-up.",
     )
+    parser.add_argument(
+        "--enable-attention-remask",
+        action="store_true",
+        help="Use attention-based scores instead of token-confidence for transfer selection.",
+    )
+    parser.add_argument(
+        "--attention-remask-top-tokens",
+        type=int,
+        default=0,
+        help="Top-k prompt/image tokens per head to average (0 = use all).",
+    )
+    parser.add_argument(
+        "--attention-remask-top-heads",
+        type=int,
+        default=0,
+        help="Top-k heads to average after token aggregation (0 = use all).",
+    )
+    parser.add_argument(
+        "--attention-remask-low-precision-softmax",
+        action="store_true",
+        help="When attention remask is enabled, use low-precision softmax to reduce VRAM.",
+    )
     parser.add_argument("--prompt-interval-steps", type=int, default=8)
     parser.add_argument("--gen-interval-steps", type=int, default=2)
     parser.add_argument("--transfer-ratio", type=float, default=0.8)
@@ -145,6 +167,11 @@ def main():
     args = parse_args()
     if args.use_fast_dllm and args.use_dllm_cache:
         raise ValueError("Choose only one of --use-fast-dllm or --use-dllm-cache.")
+    if args.enable_attention_remask and (args.use_fast_dllm or args.use_dllm_cache):
+        raise ValueError(
+            "--enable-attention-remask currently supports only the base generate path. "
+            "Disable --use-fast-dllm and --use-dllm-cache."
+        )
 
     test_json = Path(args.test_json)
     image_dir = Path(args.image_dir)
@@ -233,6 +260,13 @@ def main():
                 generate_kwargs["enable_reserved_collapse"] = True
                 generate_kwargs["reserved_token_id"] = args.reserved_token_id
                 generate_kwargs["mdm_mask_id"] = args.mdm_mask_id
+            if args.enable_attention_remask:
+                generate_kwargs["enable_attention_remask"] = True
+                generate_kwargs["attention_remask_top_tokens"] = args.attention_remask_top_tokens
+                generate_kwargs["attention_remask_top_heads"] = args.attention_remask_top_heads
+                generate_kwargs["attention_remask_low_precision_softmax"] = (
+                    args.attention_remask_low_precision_softmax
+                )
             cont = model.generate(
                 input_ids,
                 images=image_tensor,

@@ -22,7 +22,7 @@ prompt_interval_steps = 8
 gen_interval_steps = 2
 transfer_ratio = 0.8
 use_fast_dllm = False  # using fast-dLLM (https://github.com/NVlabs/Fast-dLLM) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 6s to generate 128 tokens.
-use_dllm_cache = True  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cache) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 25s to generate 128 tokens.
+use_dllm_cache = False  # using dLLM-Cache(https://github.com/maomaocun/dLLM-cache) to speed up generation. Set to True to enable caching or False to test without it. In A100, it uses around 25s to generate 128 tokens.
 
 warnings.filterwarnings("ignore")
 # pretrained = "GSAI-ML/LLaDA-V"
@@ -47,11 +47,15 @@ question = DEFAULT_IMAGE_TOKEN + "\nWhat activity is the person (or people) perf
 # question = DEFAULT_IMAGE_TOKEN + "\nWhat she Doing? Explain why."
 
 explanation_max_token = 70 
-answer_max_token = 30
+answer_max_token = 30 
 PAD = '<|reserved_token_1|>'
 enable_reserved_collapse = True
 reserved_token_id = 126085
 mdm_mask_id = 126336
+enable_attention_remask = True
+attention_remask_top_tokens = 32
+attention_remask_top_heads = 8
+attention_remask_low_precision_softmax = True
 # FIM = ''
 draft_answer = f'''Because{"<|mdm_mask|>"*explanation_max_token}, the answer is{"<|mdm_mask|>"*answer_max_token}<|eot_id|>'''
 
@@ -104,6 +108,10 @@ cont = model.generate(
     enable_reserved_collapse=enable_reserved_collapse,
     reserved_token_id=reserved_token_id,
     mdm_mask_id=mdm_mask_id,
+    enable_attention_remask=enable_attention_remask,
+    attention_remask_top_tokens=attention_remask_top_tokens,
+    attention_remask_top_heads=attention_remask_top_heads,
+    attention_remask_low_precision_softmax=attention_remask_low_precision_softmax,
 )
 end_time = time.time()
 generation_time = end_time - start_time
