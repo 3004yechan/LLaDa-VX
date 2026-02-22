@@ -1,6 +1,7 @@
 # LLaDa-VX
 
 This repository contains our LLaDa-VX training and demo code.
+This repository is forked from https://github.com/ML-GSAI/LLaDA-V.
 
 ## Environment Setup
 
