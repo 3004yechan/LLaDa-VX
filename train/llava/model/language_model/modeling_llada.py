@@ -1718,34 +1718,39 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             has_target = label_mask.any(dim=1, keepdim=True)
             # First valid position of assistant tokens per sample.
             start_idx = torch.argmax(label_mask.float(), dim=1, keepdim=True)
-
-            block_len = getattr(self.config, "fimx_answer_block_size", 0)
-            ans_prefix_len = getattr(self.config, "fimx_ans_prefix_len", 0)
-            because_prefix_len = getattr(self.config, "fimx_because_prefix_len", 0)
+            valid_lengths = label_mask.sum(dim=1, keepdim=True)
 
             positions = torch.arange(l, device=device).unsqueeze(0).expand(b, -1)
+            explanation_first = getattr(self.config, "fimx_explanation_first", False)
 
-            block_end = start_idx + block_len
-            prefix_end = torch.minimum(start_idx + ans_prefix_len, block_end)
+            if explanation_first:
+                explanation_prefix_len = getattr(self.config, "fimx_explanation_prefix_len", 0)
+                explanation_block_len = getattr(self.config, "fimx_explanation_block_size", 0)
+                answer_prefix_len = getattr(self.config, "fimx_explanation_answer_prefix_len", 0)
+                suffix_len = getattr(self.config, "fimx_explanation_suffix_len", 0)
 
-            block_mask = (positions >= start_idx) & (positions < block_end) & label_mask & has_target
-            prefix_mask = (positions >= start_idx) & (positions < prefix_end) & label_mask & has_target
-            answer_mask = block_mask & (~prefix_mask)
+                answer_start = start_idx + explanation_prefix_len + explanation_block_len + answer_prefix_len
+                valid_end = start_idx + valid_lengths
 
-            because_start = block_end
-            because_end = because_start + because_prefix_len
-            because_mask = (positions >= because_start) & (positions < because_end) & label_mask & has_target
-            explanation_mask = label_mask & (positions >= because_end) & has_target
+                # In explanation-first decoding, the answer tail (answer text + trailing period/EOT)
+                # should remain hidden until after explanation generation.
+                answer_mask = (positions >= answer_start) & (positions < valid_end) & label_mask & has_target
+                random_region_mask = label_mask & (~answer_mask) & has_target
+            else:
+                block_len = getattr(self.config, "fimx_answer_block_size", 0)
+                block_end = start_idx + block_len
+                answer_mask = (positions >= start_idx) & (positions < block_end) & label_mask & has_target
+                random_region_mask = label_mask & (positions >= block_end) & has_target
 
             eps = 1e-3
             # Per-sample masking probability to mimic original behaviour.
             base_prob = (1 - eps) * torch.rand((b, 1), device=device) + eps
             prob_matrix = base_prob.expand(-1, l)
             rand_vals = torch.rand((b, l), device=device)
-            explanation_rand_mask = explanation_mask & (rand_vals < prob_matrix)
+            random_region_rand_mask = random_region_mask & (rand_vals < prob_matrix)
 
-            primary_mask = answer_mask | explanation_rand_mask
-            complementary_mask = answer_mask | (explanation_mask & (~explanation_rand_mask))
+            primary_mask = answer_mask | random_region_rand_mask
+            complementary_mask = answer_mask | (random_region_mask & (~random_region_rand_mask))
 
             mask_token_id = torch.tensor([126336], device=device)
             masked_embed = self.model.embed_tokens(mask_token_id)
@@ -1753,12 +1758,12 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
             noisy_embeds = torch.where(primary_mask.unsqueeze(-1), masked_embed_expanded, input_embeds)
             p_mask = torch.ones_like(labels, dtype=torch.float, device=device)
-            p_mask = torch.where(explanation_mask, prob_matrix, p_mask)
+            p_mask = torch.where(random_region_mask, prob_matrix, p_mask)
 
             masked_indices = primary_mask
 
-            # Only add complementary view if explanation exists anywhere in batch.
-            if explanation_mask.any():
+            # Only add complementary view if there is any random-mask region anywhere in batch.
+            if random_region_mask.any():
                 comp_embeds = torch.where(complementary_mask.unsqueeze(-1), masked_embed_expanded, input_embeds)
                 noisy_embeds = torch.cat([noisy_embeds, comp_embeds], dim=0)
                 labels = torch.cat([labels, labels.clone()], dim=0)

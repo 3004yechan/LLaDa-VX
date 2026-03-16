@@ -1713,11 +1713,18 @@ class LazySupervisedDatasetForFIMX(Dataset):
 
         data_dict = self._tokenize(sample)
 
-        # `_tokenize` returns tensors with an extra batch dim (1, seq); squeeze to 1D like the base dataset.
-        if "input_ids" in data_dict and data_dict["input_ids"].dim() == 2 and data_dict["input_ids"].size(0) == 1:
-            data_dict["input_ids"] = data_dict["input_ids"][0]
-        if "labels" in data_dict and data_dict["labels"].dim() == 2 and data_dict["labels"].size(0) == 1:
-            data_dict["labels"] = data_dict["labels"][0]
+        # `_tokenize` follows the same contract as LazySupervisedDataset: a list with one tensor per sample.
+        # Keep supporting the tensor case in case preprocess() changes in the future.
+        if "input_ids" in data_dict:
+            if isinstance(data_dict["input_ids"], list):
+                data_dict["input_ids"] = data_dict["input_ids"][0]
+            elif data_dict["input_ids"].dim() == 2 and data_dict["input_ids"].size(0) == 1:
+                data_dict["input_ids"] = data_dict["input_ids"][0]
+        if "labels" in data_dict:
+            if isinstance(data_dict["labels"], list):
+                data_dict["labels"] = data_dict["labels"][0]
+            elif data_dict["labels"].dim() == 2 and data_dict["labels"].size(0) == 1:
+                data_dict["labels"] = data_dict["labels"][0]
 
         if "image" in sample:
             image_entry = self._process_image(sample["image"])
@@ -2249,12 +2256,14 @@ def train(attn_implementation=None):
         # Semi-complementary masking specific to FIMX-style data.
         model.config.enable_semi_complementary_masking = training_args.enable_semi_complementary_masking
         if getattr(data_args, "use_fimx_dataset", False):
-            if getattr(data_args, "fimx_explanation_first", False) and training_args.enable_semi_complementary_masking:
-                raise ValueError("`--enable_semi_complementary_masking` is incompatible with `--fimx_explanation_first`.")
             model.config.fimx_answer_block_size = getattr(data_args, "fimx_answer_block_size", 20)
             model.config.fimx_explanation_block_size = getattr(data_args, "fimx_explanation_block_size", 70)
             model.config.fimx_ans_prefix_len = len(tokenizer("The answer is", add_special_tokens=False).input_ids)
             model.config.fimx_explanation_first = getattr(data_args, "fimx_explanation_first", False)
+            model.config.fimx_explanation_prefix_len = len(tokenizer("Because ", add_special_tokens=False).input_ids)
+            model.config.fimx_explanation_answer_prefix_len = len(tokenizer(", the answer is ", add_special_tokens=False).input_ids)
+            eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+            model.config.fimx_explanation_suffix_len = len(tokenizer(".", add_special_tokens=False).input_ids) + (1 if eot_id is not None and eot_id >= 0 else 0)
         model.config.fimx_because_prefix_len = len(tokenizer(" because", add_special_tokens=False).input_ids)
 
     if training_args.bits in [4, 8]:
